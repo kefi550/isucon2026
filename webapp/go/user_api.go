@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -85,28 +86,22 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 		secretKey := uuid.NewString()
 		hash := sha256.Sum256([]byte(secretKey))
 		ctx := c.Request().Context()
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
 		// 窓の開始が通知対象を確定するまで、登録のコミットを待たせる。ユーザー名の重複は UNIQUE が見る。
-		if err := lockUserMembership(ctx, tx); err != nil {
-			return err
-		}
-		userID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO users (id, username, secret_key_hash, display_name, region) VALUES ($1, $2, $3, $4, $5)`,
-			userID, input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region); err != nil {
+		// 「membership のロック → INSERT → COMMIT」を1文（autocommit）で実行する。別々に送ると、遅延の大きいリージョンでは
+		// 往復の数だけロックを握り続け、同時に来た登録や窓の開始がその間待たされる（ロックはコミット時に解放される）。
+		var user User
+		if err := h.DB.GetContext(ctx, &user, `
+   WITH membership AS (SELECT pg_advisory_xact_lock(hashtext('user_membership'), 1))
+   INSERT INTO users (id, username, secret_key_hash, display_name, region)
+   SELECT $1::text, $2::text, $3::text, $4::text, $5::text FROM membership
+   RETURNING `+strings.Join(userColumns, ", "),
+			uuid.NewString(), input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region); err != nil {
 			if isUsernameConflict(err) {
 				return NewAPIError(http.StatusConflict, "username_taken")
 			}
 			return err
 		}
-		user, err := getUser(ctx, tx, userID)
-		if err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
 		return c.JSON(http.StatusCreated, registerResponse{SecretKey: secretKey, User: newSessionUserResponse(user)})
