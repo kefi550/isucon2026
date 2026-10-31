@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 )
 
@@ -105,9 +106,9 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		// 分からなければ全パーティションから引き、次回のために created_at を覚えておく。
 		// どちらの経路でも画像の行の有無は毎回 DB で確認するので、行が消えた画像は従来どおり署名検証の前に 403 になる。
 		if createdAt, ok := loadImageCreatedAt(input.ImageID); ok {
-			err = h.DB.GetContext(ctx, &object, imageLookupQuery+` AND i.created_at = $2`, input.ImageID, createdAt)
+			err = h.imageDB().GetContext(ctx, &object, imageLookupQuery+` AND i.created_at = $2`, input.ImageID, createdAt)
 		} else {
-			err = h.DB.GetContext(ctx, &object, imageLookupQuery, input.ImageID)
+			err = h.imageDB().GetContext(ctx, &object, imageLookupQuery, input.ImageID)
 			if err == nil {
 				storeImageCreatedAt(input.ImageID, object.CreatedAt)
 			}
@@ -136,4 +137,12 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		return c.Blob(http.StatusOK, object.MediaType, object.Data)
 	}
+}
+
+// imageDB は画像取得に使う接続プールを返す（専用のプールが無ければ通常のプール）
+func (h *HandlerContext) imageDB() *sqlx.DB {
+	if h.ImageDB != nil {
+		return h.ImageDB
+	}
+	return h.DB
 }

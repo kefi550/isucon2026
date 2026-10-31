@@ -8,12 +8,15 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 )
 
@@ -104,7 +107,24 @@ func TestGetImageEquivalence(t *testing.T) {
 			uuid.NewString(), postID, reactor.ID, newImage(reactor), base, replacedAt, deletedAt)
 	}
 
-	h := &HandlerContext{DB: db, Config: &Config{Region: "asia"}}
+	// 新しい実装は本番と同じく、計画を使い回す設定（force_generic_plan）の接続で画像を取る
+	imageDSN, err := url.Parse(os.Getenv("ISUREAL_TEST_DSN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := imageDSN.Query()
+	q.Set("plan_cache_mode", "force_generic_plan")
+	imageDSN.RawQuery = q.Encode()
+	imageDB, err := sqlx.Open("pgx", imageDSN.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer imageDB.Close()
+	var mode string
+	if err := imageDB.Get(&mode, `SHOW plan_cache_mode`); err != nil || mode != "force_generic_plan" {
+		t.Fatalf("画像用の接続で plan_cache_mode が設定されていない: %q %v", mode, err)
+	}
+	h := &HandlerContext{DB: db, ImageDB: imageDB, Config: &Config{Region: "asia"}}
 	e := echo.New()
 	e.HTTPErrorHandler = APIErrorHandler
 	// abuse の記録（guard の BAN 判定に使われる）も比較するため、レスポンスヘッダーに書き出す

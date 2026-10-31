@@ -38,6 +38,20 @@ func (c *Config) DatabaseDSN() string {
 	return u.String()
 }
 
+// ImageDatabaseDSN は画像取得専用の接続プール用の DSN。
+// 画像のテーブルは36個のパーティションに分かれていて、毎回計画を作り直すと1回40ms以上の CPU を使うため、
+// この接続だけ plan_cache_mode=force_generic_plan にして計画を使い回させる（pgx が接続時の設定として送る）。
+func (c *Config) ImageDatabaseDSN() string {
+	u, err := url.Parse(c.DatabaseDSN())
+	if err != nil {
+		return c.DatabaseDSN()
+	}
+	query := u.Query()
+	query.Set("plan_cache_mode", "force_generic_plan")
+	u.RawQuery = query.Encode()
+	return u.String()
+}
+
 func envOrDefault(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
