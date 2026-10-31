@@ -76,11 +76,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		img, err := jpeg.Decode(bytes.NewReader(imageData))
-		if err != nil {
-			return NewAPIError(http.StatusBadRequest, "invalid_post")
-		}
-		if img.Bounds().Dx() > 4096 || img.Bounds().Dy() > 4096 {
+		if !validPostJPEG(imageData) {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
 
@@ -119,6 +115,18 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))
 	}
+}
+
+// jpeg.Decode で全画素を展開すると投稿の CPU の大半を占めるので、ヘッダだけ読む。
+// 途中で切れた画像は jpeg.Decode と同じく弾くため、スキャン開始（SOS）より後に終端（EOI）があることも確かめる。
+// スキャンのデータ中の 0xFF は 0xFF00 にエスケープされるので、EOI と取り違えない。
+func validPostJPEG(data []byte) bool {
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(data))
+	if err != nil || cfg.Width > 4096 || cfg.Height > 4096 {
+		return false
+	}
+	sos := bytes.Index(data, []byte{0xFF, 0xDA})
+	return sos >= 0 && bytes.LastIndex(data, []byte{0xFF, 0xD9}) > sos
 }
 
 func newPostResponse(post Post, user User) createPostResponse {
