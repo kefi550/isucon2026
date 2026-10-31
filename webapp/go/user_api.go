@@ -92,10 +92,11 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 		var user User
 		if err := h.DB.GetContext(ctx, &user, `
    WITH membership AS (SELECT pg_advisory_xact_lock(hashtext('user_membership'), 1))
-   INSERT INTO users (id, username, secret_key_hash, display_name, region)
-   SELECT $1::text, $2::text, $3::text, $4::text, $5::text FROM membership
+   INSERT INTO users (id, username, secret_key_hash, display_name, region, search_username, search_display_name)
+   SELECT $1::text, $2::text, $3::text, $4::text, $5::text, $6::text, $7::text FROM membership
    RETURNING `+strings.Join(userColumns, ", "),
-			uuid.NewString(), input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region); err != nil {
+			uuid.NewString(), input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region,
+			normalizeSearchText(input.Username), normalizeSearchText(input.DisplayName)); err != nil {
 			if isUsernameConflict(err) {
 				return NewAPIError(http.StatusConflict, "username_taken")
 			}
@@ -195,7 +196,7 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 		}
 		if input.DisplayName != nil {
-			if _, err := tx.ExecContext(ctx, `UPDATE users SET display_name = $2, updated_at = clock_timestamp() WHERE id = $1`, session.UserID, *input.DisplayName); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE users SET display_name = $2, search_display_name = $3, updated_at = clock_timestamp() WHERE id = $1`, session.UserID, *input.DisplayName, normalizeSearchText(*input.DisplayName)); err != nil {
 				return err
 			}
 		}

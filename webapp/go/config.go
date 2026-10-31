@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 )
 
 type Config struct {
@@ -14,17 +15,31 @@ type Config struct {
 	DBPassword string
 	DBName     string
 	LogLevel   string
+	// DB への接続数の上限（open と idle の両方）
+	DBMaxConns int
 }
 
 func ConfigFromEnv() *Config {
+	region := envOrDefault("ISUREAL_REGION", "asia")
+	// asia は DB と同じリージョンで1本の接続をすぐ返すので、少ない本数で足りる。
+	// 2コアの DB に同時に流し込みすぎると、CPU とロック管理の取り合いで全員が遅くなる。
+	// europe と america は1往復 約100ms のあいだ接続を握るので、本数を多めにする。
+	maxConns := 75
+	if region == "asia" {
+		maxConns = 24
+	}
+	if n, err := strconv.Atoi(os.Getenv("ISUREAL_DB_MAX_CONNS")); err == nil && n > 0 {
+		maxConns = n
+	}
 	return &Config{
-		Region:     envOrDefault("ISUREAL_REGION", "asia"),
+		Region:     region,
 		DBHost:     envOrDefault("ISUREAL_DB_HOST", "127.0.0.1"),
 		DBPort:     envOrDefault("ISUREAL_DB_PORT", "5432"),
 		DBUser:     envOrDefault("ISUREAL_DB_USER", "isureal"),
 		DBPassword: envOrDefault("ISUREAL_DB_PASSWORD", "isureal"),
 		DBName:     envOrDefault("ISUREAL_DB_NAME", "isureal"),
 		LogLevel:   envOrDefault("ISUREAL_LOG_LEVEL", "debug"),
+		DBMaxConns: maxConns,
 	}
 }
 

@@ -6,6 +6,11 @@ CREATE INDEX IF NOT EXISTS image_objects_id ON image_objects (id);
 -- 既存の非ユニーク index は UNIQUE の作成に成功してから消す。2回目以降はどちらも何もしない。
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_key ON users (username);
 DROP INDEX IF EXISTS users_username;
+-- ユーザー検索を DB 側で絞り込むための、normalizeSearchText（Go）を通した値。
+-- 登録・表示名の変更で書き、初期化では init.sh のあとに Go が埋め直す（backfillUserSearchText）。
+-- NULL の行は検索の候補に含め、Go 側で照合する。
+ALTER TABLE users ADD COLUMN IF NOT EXISTS search_username text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS search_display_name text;
 -- 窓の開始が、リージョンの active なユーザーを読むときに使う。
 CREATE INDEX IF NOT EXISTS users_region_active ON users (region) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS login_sessions_token_hash ON login_sessions (token_hash);
