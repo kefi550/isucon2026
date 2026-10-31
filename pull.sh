@@ -24,6 +24,10 @@ for i in $(seq 1 3); do
   rsync -avr ${host}:/etc/nginx/nginx.conf "${LOCAL_PATH}/${host}/etc/nginx/nginx.conf"
   rsync -avr ${host}:/etc/nginx/sites-enabled/ "${LOCAL_PATH}/${host}/etc/nginx/sites-enabled/"
 
+  mkdir -p ${LOCAL_PATH}/${host}/etc/postgresql/16/main/
+  rsync -avr ${host}:/etc/postgresql/16/main/postgresql.conf "${LOCAL_PATH}/${host}/etc/postgresql/16/main/postgresql.conf"
+  rsync -avr ${host}:/etc/postgresql/16/main/conf.d/ "${LOCAL_PATH}/${host}/etc/postgresql/16/main/conf.d/"
+
   mkdir -p ${LOCAL_PATH}/${host}/etc/logrotate.d/
   rsync -avr ${host}:/etc/logrotate.d/ "${LOCAL_PATH}/${host}/etc/logrotate.d/"
 done
