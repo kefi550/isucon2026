@@ -2,6 +2,7 @@ package isureal
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -17,6 +18,27 @@ func TestImageUUIDRoundTrip(t *testing.T) {
 		if _, ok := parseImageUUID(bad); ok {
 			t.Errorf("parseImageUUID(%q) accepted", bad)
 		}
+	}
+}
+
+func TestInterleavePresignItems(t *testing.T) {
+	mk := func(owner uint32, n int) []presignItem {
+		out := make([]presignItem, n)
+		for i := range out {
+			out[i] = presignItem{owner: owner, id: [16]byte{byte(i)}}
+		}
+		return out
+	}
+	got := interleavePresignItems(mk(0, 2), mk(1, 4))
+	var owners []uint32
+	for _, it := range got {
+		owners = append(owners, it.owner)
+	}
+	if want := []uint32{0, 1, 1, 0, 1, 1}; fmt.Sprint(owners) != fmt.Sprint(want) {
+		t.Errorf("owners = %v, want %v", owners, want)
+	}
+	if len(interleavePresignItems(nil, mk(1, 3))) != 3 || len(interleavePresignItems(mk(0, 3), nil)) != 3 {
+		t.Error("lost items when one side is empty")
 	}
 }
 

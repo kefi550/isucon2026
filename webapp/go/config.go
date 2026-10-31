@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -25,6 +26,9 @@ type Config struct {
 	// 両方 0 / 空なら計算しない。
 	PresignLocalItems int
 	PresignWorkers    []string
+	// 自分の分のあと、末尾から計算を続ける時間。PresignWait は初期化の応答を返すまで、PresignBackground はそのあと。
+	PresignWait       time.Duration
+	PresignBackground time.Duration
 }
 
 func ConfigFromEnv() *Config {
@@ -56,6 +60,13 @@ func ConfigFromEnv() *Config {
 			presignWorkers = append(presignWorkers, host)
 		}
 	}
+	// 初期化の時間の制限は分からない（約15秒は通った）。応答のあと約35秒は負荷が軽く、isu1 の CPU が空いている。
+	presignSeconds := func(key string) time.Duration {
+		if n, err := strconv.ParseFloat(os.Getenv(key), 64); err == nil && n > 0 {
+			return time.Duration(n * float64(time.Second))
+		}
+		return 0
+	}
 	return &Config{
 		Region:         region,
 		DBHost:         envOrDefault("ISUREAL_DB_HOST", "127.0.0.1"),
@@ -69,6 +80,8 @@ func ConfigFromEnv() *Config {
 
 		PresignLocalItems: presignLocal,
 		PresignWorkers:    presignWorkers,
+		PresignWait:       presignSeconds("ISUREAL_PRESIGN_WAIT"),
+		PresignBackground: presignSeconds("ISUREAL_PRESIGN_BACKGROUND"),
 	}
 }
 

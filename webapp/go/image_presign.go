@@ -196,29 +196,83 @@ func runImagePresign(ctx context.Context, db *sqlx.DB, config *Config) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			const batch = 64
-			idx := make([]uint32, 0, batch)
-			sigs := make([][sha256.Size]byte, 0, batch)
-			for {
-				i := int(next.Add(1)) - 1
-				if i >= local || ctx.Err() != nil {
-					break
+			signLocal(store, items, func() int {
+				if i := int(next.Add(1)) - 1; i < local && ctx.Err() == nil {
+					return i
 				}
-				var sig [sha256.Size]byte
-				copy(sig[:], computeImageSignature(keys[items[i].owner][:], formatImageUUID(items[i].id), exp))
-				idx = append(idx, uint32(i))
-				sigs = append(sigs, sig)
-				if len(idx) == batch {
-					store.put(items, idx, sigs)
-					idx, sigs = idx[:0], sigs[:0]
-				}
-			}
-			store.put(items, idx, sigs)
+				return -1
+			})
 		}()
 	}
 	wg.Wait()
 	slog.Info("presign: local done", "items", local, "elapsed", time.Since(start))
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// 自分の分が終わったら、ssh 先と反対側（末尾）から計算する。ssh 先が済ませた分は飛ばす。
+	// 初期化の中で config.PresignWait 待ち、応答のあとも負荷が上がるまで config.PresignBackground 続ける。
+	waitUntil := time.Now().Add(config.PresignWait)
+	stopAt := waitUntil.Add(config.PresignBackground)
+	var back atomic.Int64
+	var tail sync.WaitGroup
+	for range runtime.GOMAXPROCS(0) {
+		tail.Add(1)
+		go func() {
+			defer tail.Done()
+			signLocal(store, items, func() int {
+				for bg.Err() == nil && time.Now().Before(stopAt) {
+					i := len(items) - 1 - int(back.Add(1)-1)
+					if i < local {
+						return -1
+					}
+					if !store.has(items[i].id) {
+						return i
+					}
+				}
+				return -1
+			})
+		}()
+	}
+	go func() {
+		tail.Wait()
+		slog.Info("presign: local tail done", "items", back.Load(), "elapsed", time.Since(start))
+	}()
+	select {
+	case <-time.After(time.Until(waitUntil)):
+	case <-ctx.Done():
+	}
+	slog.Info("presign: initialize returns", "presigned", imagePresigned.Value(), "items", len(items), "elapsed", time.Since(start))
 	return ctx.Err()
+}
+
+// signLocal は next が返す番号（-1 で終わり）の署名を計算してキャッシュに入れる。
+func signLocal(store *presignStore, items []presignItem, next func() int) {
+	const batch = 64
+	idx := make([]uint32, 0, batch)
+	sigs := make([][sha256.Size]byte, 0, batch)
+	for {
+		i := next()
+		if i < 0 {
+			break
+		}
+		var sig [sha256.Size]byte
+		copy(sig[:], computeImageSignature(store.keys[items[i].owner][:], formatImageUUID(items[i].id), store.exp))
+		idx = append(idx, uint32(i))
+		sigs = append(sigs, sig)
+		if len(idx) == batch {
+			store.put(items, idx, sigs)
+			idx, sigs = idx[:0], sigs[:0]
+		}
+	}
+	store.put(items, idx, sigs)
+}
+
+func (s *presignStore) has(id [16]byte) bool {
+	s.mu.RLock()
+	_, ok := s.sigs[id]
+	s.mu.RUnlock()
+	return ok
 }
 
 // loadPresignItems は署名の対象を、当たりやすい順（プロフィール画像、投稿、リアクション）に並べて返す。
@@ -254,7 +308,8 @@ func loadPresignItems(ctx context.Context, db *sqlx.DB) ([][sha256.Size]byte, []
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
-	for _, query := range []string{
+	var lists [2][]presignItem
+	for q, query := range []string{
 		`SELECT author_id, image_id FROM posts WHERE deleted_at IS NULL`,
 		`SELECT reactor_id, image_id FROM realmojis WHERE replaced_at IS NULL AND deleted_at IS NULL`,
 	} {
@@ -273,7 +328,7 @@ func loadPresignItems(ctx context.Context, db *sqlx.DB) ([][sha256.Size]byte, []
 				continue
 			}
 			if uuid, ok := parseImageUUID(string(imageID)); ok {
-				items = append(items, presignItem{owner: owner, id: uuid})
+				lists[q] = append(lists[q], presignItem{owner: owner, id: uuid})
 			}
 		}
 		rows.Close()
@@ -281,7 +336,23 @@ func loadPresignItems(ctx context.Context, db *sqlx.DB) ([][sha256.Size]byte, []
 			return nil, nil, err
 		}
 	}
-	return keys, items, nil
+	return keys, append(items, interleavePresignItems(lists[0], lists[1])...), nil
+}
+
+// interleavePresignItems は a と b を件数の比で混ぜる（どこで打ち切られても両方が同じ割合で進んでいる）。
+func interleavePresignItems(a, b []presignItem) []presignItem {
+	out := make([]presignItem, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		if j >= len(b) || (i < len(a) && i*len(b) <= j*len(a)) {
+			out = append(out, a[i])
+			i++
+		} else {
+			out = append(out, b[j])
+			j++
+		}
+	}
+	return out
 }
 
 // presign-worker とのやりとり（リトルエンディアン）。
