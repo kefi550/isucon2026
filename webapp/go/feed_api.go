@@ -54,7 +54,16 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		if ranked {
 			beforePostedAt, beforeID = nil, ""
 		}
-		// 閲覧者の情報・関係・投稿候補は互いに依存しないので、並列に投げて往復1回分の待ちにする
+		// 閲覧者の情報・関係・投稿候補は互いに依存しないので、並列に投げて往復1回分の待ちにする。
+		// 投稿候補の SQL が可視性の条件をすべて見ているので、ここで読む関係は、その結果を確認し直すための最小限でよい:
+		// 公開フィードはブロックだけ、友達フィードは直接の友達とブロックだけ（友達の友達は読まない）。
+		selectRelations := selectViewerRelations
+		switch input.Feed {
+		case "public":
+			selectRelations = selectViewerBlockedRelations
+		case "friends":
+			selectRelations = selectViewerDirectRelations
+		}
 		var (
 			row       viewerRow
 			relations []viewerRelation
@@ -67,7 +76,7 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		})
 		g.Go(func() (err error) {
-			relations, err = selectViewerRelations(gctx, h.DB, viewerID)
+			relations, err = selectRelations(gctx, h.DB, viewerID)
 			return err
 		})
 		g.Go(func() (err error) {

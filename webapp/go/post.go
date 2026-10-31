@@ -154,6 +154,33 @@ func selectViewerRow(ctx context.Context, db sqlx.QueryerContext, viewerID strin
 
 // ブロック関係と、友達・友達の友達の算出に必要な友達関係を1往復で取得する。
 // 友達の友達関係には viewer 自身との関係も必ず含まれるため、そこから友達一覧も復元できる。
+// selectViewerDirectRelations は、ブロックと直接の友達だけを読む（友達の友達は読まない）。
+// 友達フィードの確認（canView / matchesFeed）に必要なのは Friends と Blocked だけで、
+// 友達の友達（selectViewerRelations の2ホップ目）は判定に使われない。
+// buildViewerContext に渡すと FriendsOfFriends は「自分と友達」だけになるが、友達フィードでは参照されない。
+func selectViewerDirectRelations(ctx context.Context, db sqlx.QueryerContext, viewerID string) ([]viewerRelation, error) {
+	var relations []viewerRelation
+	err := sqlx.SelectContext(ctx, db, &relations, `
+  SELECT 'b' AS kind, CASE WHEN blocker_id = $1 THEN blocked_id ELSE blocker_id END AS first_id, '' AS second_id
+  FROM block_relations WHERE blocker_id = $1 OR blocked_id = $1
+  UNION ALL
+  SELECT 'f' AS kind, user_low_id AS first_id, user_high_id AS second_id
+  FROM friendships WHERE user_low_id = $1 OR user_high_id = $1
+ `, viewerID)
+	return relations, err
+}
+
+// selectViewerBlockedRelations は、ブロックだけを読む。
+// 公開フィードの確認（canView / matchesFeed）に必要なのは Blocked だけで、公開の投稿は友達かどうかに関係なく見える。
+func selectViewerBlockedRelations(ctx context.Context, db sqlx.QueryerContext, viewerID string) ([]viewerRelation, error) {
+	var relations []viewerRelation
+	err := sqlx.SelectContext(ctx, db, &relations, `
+  SELECT 'b' AS kind, CASE WHEN blocker_id = $1 THEN blocked_id ELSE blocker_id END AS first_id, '' AS second_id
+  FROM block_relations WHERE blocker_id = $1 OR blocked_id = $1
+ `, viewerID)
+	return relations, err
+}
+
 func selectViewerRelations(ctx context.Context, db sqlx.QueryerContext, viewerID string) ([]viewerRelation, error) {
 	var relations []viewerRelation
 	err := sqlx.SelectContext(ctx, db, &relations, `
