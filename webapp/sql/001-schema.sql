@@ -213,15 +213,15 @@ CREATE TABLE comments (
 );
 CREATE INDEX comments_post_id_created_at_id ON comments (post_id, created_at, id);
 
+-- 窓の開始で全ユーザー分を一括 INSERT するので、索引は UNIQUE(窓, ユーザー) だけにする（理由は 002-indexes.sql）。
+-- PK と外部キーは持たない。
 CREATE TABLE notifications (
-  id varchar(36) PRIMARY KEY,
-  user_id varchar(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-  posting_window_id varchar(36) NOT NULL REFERENCES posting_windows(id) ON DELETE RESTRICT,
-  created_at timestamptz NOT NULL,
-  UNIQUE(user_id,posting_window_id)
+  id varchar(36) NOT NULL,
+  user_id varchar(36) NOT NULL,
+  posting_window_id varchar(36) NOT NULL,
+  created_at timestamptz NOT NULL
 );
-CREATE INDEX notifications_user_id_created_at ON notifications (user_id, created_at);
-CREATE INDEX notifications_posting_window_id ON notifications (posting_window_id);
+CREATE UNIQUE INDEX notifications_posting_window_id_user_id_key ON notifications (posting_window_id, user_id);
 
 CREATE TABLE ip_bans (
   ip text PRIMARY KEY,
