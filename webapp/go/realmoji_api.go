@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -102,16 +103,33 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
 		ctx := c.Request().Context()
-		allowed, err := canViewPost(ctx, h.DB, GetSession(c).UserID, input.PostID)
-		if err != nil {
-			return err
+		// 権限の判定と RealMoji の取得を並列に投げる。権限がなければ RealMoji は捨てる。
+		// エラーは従来の逐次処理と同じ順番（権限の判定 → 403 → RealMoji の取得）で判定する。
+		var (
+			allowed      bool
+			allowedErr   error
+			reactions    []RealMojiWithReactor
+			reactionsErr error
+			wg           sync.WaitGroup
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			allowed, allowedErr = canViewPost(ctx, h.DB, GetSession(c).UserID, input.PostID)
+		}()
+		go func() {
+			defer wg.Done()
+			reactions, reactionsErr = selectCurrentRealMojis(ctx, h.DB, `AND r.post_id=$1 AND ($2::timestamptz IS NULL OR (r.created_at,r.id)<($2,$3)) ORDER BY r.created_at DESC,r.id DESC LIMIT 51`, input.PostID, input.BeforeCreatedAt, input.BeforeID)
+		}()
+		wg.Wait()
+		if allowedErr != nil {
+			return allowedErr
 		}
 		if !allowed {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
-		reactions, err := selectCurrentRealMojis(ctx, h.DB, `AND r.post_id=$1 AND ($2::timestamptz IS NULL OR (r.created_at,r.id)<($2,$3)) ORDER BY r.created_at DESC,r.id DESC LIMIT 51`, input.PostID, input.BeforeCreatedAt, input.BeforeID)
-		if err != nil {
-			return err
+		if reactionsErr != nil {
+			return reactionsErr
 		}
 		items := make([]replaceRealMojiResponse, 0, len(reactions))
 		for _, reaction := range reactions {

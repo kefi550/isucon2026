@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -228,22 +229,67 @@ func (viewer viewerContext) canView(post Post) bool {
 	}
 }
 
-func canViewPost(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string) (bool, error) {
-	post, err := getPostWithAuthor(ctx, db, postID)
-	if errors.Is(err, sql.ErrNoRows) {
+// postAndViewer は、投稿と閲覧者の情報を並列に取得した結果。エラーはそれぞれ別に持つ。
+type postAndViewer struct {
+	Post      PostWithAuthor
+	PostErr   error
+	Viewer    viewerContext
+	ViewerErr error
+}
+
+// loadPostAndViewer は、投稿（getPostWithAuthor）と閲覧者の情報（loadViewerContext と同じ2本）を並列に取得する。
+// 呼び出し側は、従来の逐次処理と同じ順番（PostErr → ViewerErr）でエラーを判定すること。
+// errgroup を使わないのは、片方のエラー（ErrNoRows など）で他方が取り消され、従来とは違うエラーになるのを防ぐため。
+func loadPostAndViewer(ctx context.Context, db *sqlx.DB, postID, viewerID string) postAndViewer {
+	var (
+		result    postAndViewer
+		row       viewerRow
+		rowErr    error
+		relations []viewerRelation
+		relErr    error
+		wg        sync.WaitGroup
+	)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		result.Post, result.PostErr = getPostWithAuthor(ctx, db, postID)
+	}()
+	go func() {
+		defer wg.Done()
+		row, rowErr = selectViewerRow(ctx, db, viewerID)
+	}()
+	go func() {
+		defer wg.Done()
+		relations, relErr = selectViewerRelations(ctx, db, viewerID)
+	}()
+	wg.Wait()
+	// loadViewerContext と同じ順番（行 → 関係 → 組み立て）でエラーを決める
+	switch {
+	case rowErr != nil:
+		result.ViewerErr = rowErr
+	case relErr != nil:
+		result.ViewerErr = relErr
+	default:
+		result.Viewer, result.ViewerErr = buildViewerContext(row, relations)
+	}
+	return result
+}
+
+func canViewPost(ctx context.Context, db *sqlx.DB, viewerID, postID string) (bool, error) {
+	loaded := loadPostAndViewer(ctx, db, postID, viewerID)
+	if errors.Is(loaded.PostErr, sql.ErrNoRows) {
 		return false, nil
 	}
-	if err != nil {
-		return false, err
+	if loaded.PostErr != nil {
+		return false, loaded.PostErr
 	}
-	viewer, err := loadViewerContext(ctx, db, viewerID)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(loaded.ViewerErr, sql.ErrNoRows) {
 		return false, nil
 	}
-	if err != nil {
-		return false, err
+	if loaded.ViewerErr != nil {
+		return false, loaded.ViewerErr
 	}
-	return viewer.canView(post.Post), nil
+	return loaded.Viewer.canView(loaded.Post.Post), nil
 }
 
 func getFriendIDs(ctx context.Context, db sqlx.QueryerContext, userID string) ([]string, error) {

@@ -187,15 +187,16 @@ func getPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		post, err := getPostWithAuthor(ctx, h.DB, input.PostID)
+		// 投稿と閲覧者の情報を並列に取得する。エラーの判定の順番は従来の逐次処理と同じ（投稿 → 閲覧者）。
+		loaded := loadPostAndViewer(c.Request().Context(), h.DB, input.PostID, GetSession(c).UserID)
+		post, err := loaded.Post, loaded.PostErr
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
 		if err != nil {
 			return err
 		}
-		viewer, err := loadViewerContext(ctx, h.DB, GetSession(c).UserID)
+		viewer, err := loaded.Viewer, loaded.ViewerErr
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}

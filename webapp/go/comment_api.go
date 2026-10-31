@@ -2,6 +2,7 @@ package isureal
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -73,16 +74,33 @@ func getCommentsHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
 		ctx := c.Request().Context()
-		allowed, err := canComment(ctx, h.DB, GetSession(c).UserID, input.PostID)
-		if err != nil {
-			return err
+		// 権限の判定とコメントの取得を並列に投げる。権限がなければコメントは捨てる。
+		// エラーは従来の逐次処理と同じ順番（権限の判定 → 403 → コメントの取得）で判定する。
+		var (
+			allowed     bool
+			allowedErr  error
+			comments    []CommentWithAuthor
+			commentsErr error
+			wg          sync.WaitGroup
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			allowed, allowedErr = canComment(ctx, h.DB, GetSession(c).UserID, input.PostID)
+		}()
+		go func() {
+			defer wg.Done()
+			comments, commentsErr = selectCommentsWithAuthor(ctx, h.DB, `AND c.post_id=$1 AND ($2::timestamptz IS NULL OR (c.created_at,c.id)>($2,$3)) ORDER BY c.created_at,c.id LIMIT 51`, input.PostID, input.AfterCreatedAt, input.AfterID)
+		}()
+		wg.Wait()
+		if allowedErr != nil {
+			return allowedErr
 		}
 		if !allowed {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
-		comments, err := selectCommentsWithAuthor(ctx, h.DB, `AND c.post_id=$1 AND ($2::timestamptz IS NULL OR (c.created_at,c.id)>($2,$3)) ORDER BY c.created_at,c.id LIMIT 51`, input.PostID, input.AfterCreatedAt, input.AfterID)
-		if err != nil {
-			return err
+		if commentsErr != nil {
+			return commentsErr
 		}
 		items := make([]createCommentResponse, 0, len(comments))
 		for _, comment := range comments {

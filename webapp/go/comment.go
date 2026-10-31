@@ -45,21 +45,22 @@ func selectCommentsWithAuthor(ctx context.Context, db sqlx.QueryerContext, condi
 	return comments, nil
 }
 
-func canComment(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string) (bool, error) {
-	post, err := getPostWithAuthor(ctx, db, postID)
-	if errors.Is(err, sql.ErrNoRows) {
+func canComment(ctx context.Context, db *sqlx.DB, viewerID, postID string) (bool, error) {
+	// 投稿と閲覧者の情報を並列に取得する。エラーの判定の順番は従来の逐次処理と同じ（投稿 → 閲覧者）。
+	loaded := loadPostAndViewer(ctx, db, postID, viewerID)
+	if errors.Is(loaded.PostErr, sql.ErrNoRows) {
 		return false, nil
 	}
-	if err != nil {
-		return false, err
+	if loaded.PostErr != nil {
+		return false, loaded.PostErr
 	}
-	viewer, err := loadViewerContext(ctx, db, viewerID)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(loaded.ViewerErr, sql.ErrNoRows) {
 		return false, nil
 	}
-	if err != nil {
-		return false, err
+	if loaded.ViewerErr != nil {
+		return false, loaded.ViewerErr
 	}
+	post, viewer := loaded.Post, loaded.Viewer
 	if !viewer.canView(post.Post) || post.WindowEndedAt != nil {
 		return false, nil
 	}
