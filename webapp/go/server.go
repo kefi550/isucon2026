@@ -2,6 +2,7 @@ package isureal
 
 import (
 	"os"
+	"sync"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
@@ -14,6 +15,9 @@ type HandlerContext struct {
 	DB     *sqlx.DB
 	Config *Config
 	IPBans *IPBanList
+
+	notificationOnce sync.Once
+	notifications    *notificationBroker
 }
 
 func NewServer(config *Config) *echo.Echo {

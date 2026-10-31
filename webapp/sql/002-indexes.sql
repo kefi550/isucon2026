@@ -14,6 +14,8 @@ CREATE INDEX IF NOT EXISTS posts_posted_at_id ON posts (posted_at, id);
 CREATE INDEX IF NOT EXISTS realmojis_image_id ON realmojis (image_id);
 CREATE INDEX IF NOT EXISTS comments_post_id_created_at_id ON comments (post_id, created_at, id);
 CREATE INDEX IF NOT EXISTS notifications_user_id_created_at ON notifications (user_id, created_at);
+-- 開いている投稿期間の通知を、接続中のユーザーへまとめて配る。
+CREATE INDEX IF NOT EXISTS notifications_posting_window_id ON notifications (posting_window_id);
 
 -- (post_id) だけの index は (post_id, created_at, id) に含まれる。
 DROP INDEX IF EXISTS comments_post_id;
