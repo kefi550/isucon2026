@@ -32,12 +32,16 @@ func imageSignatureExpiry(now time.Time) int64 {
 
 func computeImageSignature(key []byte, imageID string, exp int64) []byte {
 	value := []byte(strconv.FormatInt(exp, 10) + ":" + imageID)
+	// HMAC を1つだけ作り、Reset で鍵から導出済みの状態へ戻して使い回す（毎回 hmac.New すると鍵の処理と確保が1000回走る）。
+	mac := hmac.New(sha256.New, key)
+	sum := make([]byte, 0, sha256.Size)
 	for range imageSignatureIterations {
-		mac := hmac.New(sha256.New, key)
+		mac.Reset()
 		mac.Write(value)
-		value = mac.Sum(nil)
+		sum = mac.Sum(sum[:0])
+		value = append(value[:0], sum...)
 	}
-	return value
+	return append([]byte(nil), value...)
 }
 
 type imageSignatureCacheKey struct {

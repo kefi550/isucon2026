@@ -1,7 +1,9 @@
 package isureal
 
 import (
+	"bytes"
 	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"net/url"
 	"strconv"
@@ -116,4 +118,38 @@ func bytesRepeat(b byte) []byte {
 		key[i] = b
 	}
 	return key
+}
+
+// 署名の形式は変えられないので、毎回 hmac.New する元の実装と出力が一致することを確認する。
+func referenceImageSignature(key []byte, imageID string, exp int64) []byte {
+	value := []byte(strconv.FormatInt(exp, 10) + ":" + imageID)
+	for range imageSignatureIterations {
+		mac := hmac.New(sha256.New, key)
+		mac.Write(value)
+		value = mac.Sum(nil)
+	}
+	return value
+}
+
+func TestComputeImageSignatureMatchesReference(t *testing.T) {
+	keys := [][]byte{bytesRepeat(0xab), bytesRepeat(0x00), bytesRepeat(0xff)}
+	imageIDs := []string{"11111111-1111-1111-1111-111111111111", "e3ff3626-648e-4825-8c85-d037179b7eaf", ""}
+	for _, key := range keys {
+		for _, imageID := range imageIDs {
+			for _, exp := range []int64{0, 1793415708, 1793498538, 1<<62 - 1} {
+				got := computeImageSignature(key, imageID, exp)
+				want := referenceImageSignature(key, imageID, exp)
+				if !bytes.Equal(got, want) {
+					t.Fatalf("key=%x imageID=%q exp=%d\ngot  %x\nwant %x", key[:1], imageID, exp, got, want)
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkComputeImageSignature(b *testing.B) {
+	key := bytesRepeat(0xab)
+	for i := 0; i < b.N; i++ {
+		computeImageSignature(key, "e3ff3626-648e-4825-8c85-d037179b7eaf", int64(1793415708+i))
+	}
 }
