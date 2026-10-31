@@ -22,6 +22,7 @@ DECLARE
   v_starts_at timestamptz;
   v_active int;
   v_deleted int;
+  v_posted_at timestamptz := p_posted_at;
 BEGIN
   -- 画像の書き込みは行ロックを取らない。スロットの確認だけ、ロックのあとで行う。
   INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at)
@@ -45,18 +46,29 @@ BEGIN
     END IF;
   END IF;
 
+  -- 元の実装は投稿時刻をロックの取得後に決めていた。ロックを待つあいだに期間が切り替わったときは、
+  -- 受け付けた時刻が新しい期間の開始より前になるので、ロック後の時刻を投稿時刻にする。
+  -- export は画像と投稿を created_at = posted_at で結ぶので、画像の created_at も合わせる。
+  IF v_posted_at < v_starts_at THEN
+    v_posted_at := clock_timestamp();
+    IF v_posted_at < v_starts_at THEN
+      RAISE EXCEPTION USING ERRCODE = 'IR409', MESSAGE = 'post_slot_unavailable';
+    END IF;
+    UPDATE image_objects SET created_at = v_posted_at WHERE id = p_image_id AND created_at = p_posted_at;
+  END IF;
+
   SELECT count(*) FILTER (WHERE p.deleted_at IS NULL), count(*) FILTER (WHERE p.deleted_at IS NOT NULL)
   INTO v_active, v_deleted
   FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
   WHERE p.author_id = p_user_id AND w.local_date = v_local_date;
-  IF v_active <> 0 OR v_deleted >= 2 OR p_posted_at < v_starts_at THEN
+  IF v_active <> 0 OR v_deleted >= 2 THEN
     RAISE EXCEPTION USING ERRCODE = 'IR409', MESSAGE = 'post_slot_unavailable';
   END IF;
 
   INSERT INTO posts (id, author_id, posting_window_id, image_id, caption, visibility,
                      location_kind, latitude, longitude, locality, posted_at)
   VALUES (p_post_id, p_user_id, v_window_id, p_image_id, p_caption, p_visibility,
-          p_location_kind, p_latitude, p_longitude, p_locality, p_posted_at);
+          p_location_kind, p_latitude, p_longitude, p_locality, v_posted_at);
 
   RETURN QUERY
   SELECT u.id::text, u.username::text, u.secret_key_hash, u.display_name, u.bio,
