@@ -9,7 +9,7 @@ Group=isucon
 SupplementaryGroups=systemd-journal
 EnvironmentFile=/home/isucon/env.sh
 Environment=GUARD_JOURNAL_UNIT=isureal-*.service
-Environment=GUARD_FAIL_THRESHOLD=10
+Environment=GUARD_FAIL_THRESHOLD=5
 Environment=GUARD_FAIL_WINDOW=10s
 Environment=GUARD_BAN_DURATION=2m
 ExecStart=/opt/isureal-guard/bin/isureal-guard
