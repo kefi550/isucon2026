@@ -101,3 +101,234 @@ BEGIN
                       v_user.region, v_user.account_type, v_user.status;
 END
 $$;
+
+-- 投稿の閲覧可否とコメント可否。Go の canViewPost（viewerContext.canView）と canComment と同じ判定。
+-- 投稿が無い・削除済み・投稿者が退会済み、または閲覧者が退会済みなら両方 false。
+CREATE OR REPLACE FUNCTION isureal_post_access(p_viewer_id text, p_post_id text)
+RETURNS TABLE (can_view boolean, can_comment boolean) LANGUAGE plpgsql AS $$
+DECLARE
+  v_author_id text;
+  v_visibility text;
+  v_window_ended_at timestamptz;
+  v_region text;
+  v_posted_today boolean;
+  v_friend_ids text[];
+  v_friend boolean;
+  v_can_view boolean;
+BEGIN
+  SELECT p.author_id, p.visibility, w.ended_at INTO v_author_id, v_visibility, v_window_ended_at
+  FROM posts p
+  JOIN posting_windows w ON w.id = p.posting_window_id
+  JOIN users u ON u.id = p.author_id AND u.status = 'active'
+  WHERE p.id = p_post_id AND p.deleted_at IS NULL;
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT false, false;
+    RETURN;
+  END IF;
+
+  SELECT u.region INTO v_region FROM users u WHERE u.id = p_viewer_id AND u.status = 'active';
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT false, false;
+    RETURN;
+  END IF;
+
+  SELECT EXISTS(
+    SELECT 1 FROM posts p
+    JOIN posting_windows posted ON posted.id = p.posting_window_id
+    JOIN posting_windows current ON current.region = v_region AND current.ended_at IS NULL
+                                AND current.local_date = posted.local_date
+    WHERE p.author_id = p_viewer_id AND p.deleted_at IS NULL
+  ) INTO v_posted_today;
+
+  IF v_author_id = p_viewer_id THEN
+    RETURN QUERY SELECT true, v_window_ended_at IS NULL AND v_posted_today;
+    RETURN;
+  END IF;
+
+  IF v_window_ended_at IS NOT NULL OR NOT v_posted_today OR EXISTS(
+    SELECT 1 FROM block_relations b
+    WHERE (b.blocker_id = p_viewer_id AND b.blocked_id = v_author_id)
+       OR (b.blocker_id = v_author_id AND b.blocked_id = p_viewer_id)
+  ) THEN
+    RETURN QUERY SELECT false, false;
+    RETURN;
+  END IF;
+
+  IF v_visibility = 'public' THEN
+    RETURN QUERY SELECT true, true;
+    RETURN;
+  END IF;
+
+  v_friend_ids := ARRAY(
+    SELECT CASE WHEN f.user_low_id = p_viewer_id THEN f.user_high_id ELSE f.user_low_id END
+    FROM friendships f WHERE f.user_low_id = p_viewer_id OR f.user_high_id = p_viewer_id
+  );
+  v_friend := v_author_id = ANY(v_friend_ids);
+  IF v_visibility = 'friends' THEN
+    v_can_view := v_friend;
+  ELSIF v_visibility = 'friends_of_friends' THEN
+    v_can_view := v_friend OR EXISTS(
+      SELECT 1 FROM friendships f
+      WHERE (f.user_low_id = v_author_id AND f.user_high_id = ANY(v_friend_ids))
+         OR (f.user_high_id = v_author_id AND f.user_low_id = ANY(v_friend_ids))
+    );
+  ELSE
+    v_can_view := false;
+  END IF;
+  RETURN QUERY SELECT v_can_view, v_can_view AND v_friend;
+END
+$$;
+
+-- RealMoji の置き換えを1往復で行う。処理の順序とロックは Go で1文ずつ発行していたときと同じ。
+-- 受理できないときは IR403 / IR404（MESSAGE がエラーコード）で例外にして、画像の INSERT ごとロールバックさせる。
+CREATE OR REPLACE FUNCTION isureal_replace_realmoji(
+  p_id text, p_image_id text, p_post_id text, p_actor_id text, p_data bytea, p_reaction_type text
+) RETURNS TABLE (
+  id text, post_id text, reactor_id text, image_id text, reaction_type text,
+  created_at timestamptz, replaced_at timestamptz, deleted_at timestamptz,
+  user_id text, username text, secret_key_hash text, display_name text, bio text,
+  profile_image_id text, region text, account_type text, status text
+) LANGUAGE plpgsql AS $$
+#variable_conflict use_column
+DECLARE
+  v_author_id text;
+  v_locked int;
+BEGIN
+  SELECT p.author_id INTO v_author_id
+  FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
+  WHERE p.id = p_post_id AND p.deleted_at IS NULL;
+  IF NOT FOUND OR v_author_id = p_actor_id THEN
+    RAISE EXCEPTION USING ERRCODE = 'IR403', MESSAGE = 'interaction_forbidden';
+  END IF;
+
+  -- 画像の書き込みが終わるまで、2人分の行ロックは取らない。
+  INSERT INTO image_objects (id, owner_user_id, data, media_type)
+  VALUES (p_image_id, p_actor_id, p_data, 'image/jpeg');
+
+  -- lockRelationshipUsers と同じく、id のバイト順でロックする。
+  SELECT count(*) INTO v_locked FROM (
+    SELECT u.id FROM users u
+    WHERE u.id = ANY(ARRAY[p_actor_id, v_author_id]) AND u.status = 'active'
+    ORDER BY u.id COLLATE "C" FOR NO KEY UPDATE
+  ) locked;
+  IF v_locked <> 2 THEN
+    RAISE EXCEPTION USING ERRCODE = 'IR404', MESSAGE = 'relationship_not_found';
+  END IF;
+
+  IF NOT (SELECT a.can_view FROM isureal_post_access(p_actor_id, p_post_id) a) THEN
+    RAISE EXCEPTION USING ERRCODE = 'IR403', MESSAGE = 'interaction_forbidden';
+  END IF;
+
+  UPDATE realmojis r SET replaced_at = clock_timestamp()
+  WHERE r.post_id = p_post_id AND r.reactor_id = p_actor_id AND r.replaced_at IS NULL AND r.deleted_at IS NULL;
+
+  INSERT INTO realmojis (id, post_id, reactor_id, image_id, reaction_type, created_at)
+  VALUES (p_id, p_post_id, p_actor_id, p_image_id, p_reaction_type, clock_timestamp());
+
+  RETURN QUERY
+  SELECT r.id::text, r.post_id::text, r.reactor_id::text, r.image_id::text, r.reaction_type,
+         r.created_at, r.replaced_at, r.deleted_at,
+         u.id::text, u.username::text, u.secret_key_hash, u.display_name, u.bio,
+         u.profile_image_id::text, u.region, u.account_type, u.status
+  FROM realmojis r JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
+  WHERE r.id = p_id;
+END
+$$;
+
+-- コメントの作成を1往復で行う。処理の順序とロックは Go で1文ずつ発行していたときと同じ。
+CREATE OR REPLACE FUNCTION isureal_create_comment(
+  p_id text, p_post_id text, p_actor_id text, p_body text
+) RETURNS TABLE (
+  id text, post_id text, author_id text, body text, created_at timestamptz, deleted_at timestamptz,
+  user_id text, username text, secret_key_hash text, display_name text, bio text,
+  profile_image_id text, region text, account_type text, status text
+) LANGUAGE plpgsql AS $$
+#variable_conflict use_column
+DECLARE
+  v_author_id text;
+  v_locked int;
+BEGIN
+  SELECT p.author_id INTO v_author_id
+  FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
+  WHERE p.id = p_post_id AND p.deleted_at IS NULL;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE = 'IR403', MESSAGE = 'interaction_forbidden';
+  END IF;
+
+  -- 自分の投稿へのコメントなら1人分だけロックする。退会済みでもロックは取る（従来どおり）。
+  SELECT count(*) INTO v_locked FROM (
+    SELECT u.id FROM users u
+    WHERE u.id = ANY(ARRAY[p_actor_id, v_author_id])
+    ORDER BY u.id COLLATE "C" FOR NO KEY UPDATE
+  ) locked;
+  IF (p_actor_id = v_author_id AND v_locked <> 1) OR (p_actor_id <> v_author_id AND v_locked <> 2) THEN
+    RAISE EXCEPTION 'user % or % not found', p_actor_id, v_author_id;
+  END IF;
+
+  IF NOT (SELECT a.can_comment FROM isureal_post_access(p_actor_id, p_post_id) a) THEN
+    RAISE EXCEPTION USING ERRCODE = 'IR403', MESSAGE = 'interaction_forbidden';
+  END IF;
+
+  INSERT INTO comments (id, post_id, author_id, body, created_at)
+  VALUES (p_id, p_post_id, p_actor_id, p_body, clock_timestamp());
+
+  RETURN QUERY
+  SELECT c.id::text, c.post_id::text, c.author_id::text, c.body, c.created_at, c.deleted_at,
+         u.id::text, u.username::text, u.secret_key_hash, u.display_name, u.bio,
+         u.profile_image_id::text, u.region, u.account_type, u.status
+  FROM comments c JOIN users u ON u.id = c.author_id AND u.status = 'active'
+  WHERE c.id = p_id;
+END
+$$;
+
+-- RealMoji の削除を1往復で行う。削除できるのは、付けた本人か投稿者。
+CREATE OR REPLACE FUNCTION isureal_delete_realmoji(p_id text, p_actor_id text)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  v_reactor_id text;
+  v_author_id text;
+BEGIN
+  PERFORM 1 FROM users u WHERE u.id = p_actor_id FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'user % not found', p_actor_id;
+  END IF;
+
+  SELECT r.reactor_id, p.author_id INTO v_reactor_id, v_author_id
+  FROM realmojis r JOIN posts p ON p.id = r.post_id
+  WHERE r.id = p_id AND r.deleted_at IS NULL FOR UPDATE OF r;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE = 'IR404', MESSAGE = 'interaction_not_found';
+  END IF;
+  IF p_actor_id <> v_reactor_id AND p_actor_id <> v_author_id THEN
+    RAISE EXCEPTION USING ERRCODE = 'IR403', MESSAGE = 'interaction_forbidden';
+  END IF;
+
+  UPDATE realmojis SET deleted_at = clock_timestamp() WHERE id = p_id;
+END
+$$;
+
+-- コメントの削除を1往復で行う。削除できるのは、書いた本人か投稿者。
+CREATE OR REPLACE FUNCTION isureal_delete_comment(p_id text, p_actor_id text)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  v_comment_author_id text;
+  v_post_author_id text;
+BEGIN
+  PERFORM 1 FROM users u WHERE u.id = p_actor_id FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'user % not found', p_actor_id;
+  END IF;
+
+  SELECT c.author_id, p.author_id INTO v_comment_author_id, v_post_author_id
+  FROM comments c JOIN posts p ON p.id = c.post_id
+  WHERE c.id = p_id AND c.deleted_at IS NULL FOR UPDATE OF c;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE = 'IR404', MESSAGE = 'interaction_not_found';
+  END IF;
+  IF p_actor_id <> v_comment_author_id AND p_actor_id <> v_post_author_id THEN
+    RAISE EXCEPTION USING ERRCODE = 'IR403', MESSAGE = 'interaction_forbidden';
+  END IF;
+
+  UPDATE comments SET deleted_at = clock_timestamp() WHERE id = p_id;
+END
+$$;

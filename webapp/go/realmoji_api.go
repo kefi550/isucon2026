@@ -2,8 +2,6 @@ package isureal
 
 import (
 	"bytes"
-	"database/sql"
-	"errors"
 	"image/jpeg"
 	"io"
 	"mime/multipart"
@@ -64,56 +62,22 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		ctx := c.Request().Context()
-		actor := GetSession(c).UserID
-		post, err := getPost(ctx, h.DB, input.PostID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
+		// 投稿の確認から画像の保存、権限の確認、置き換えまでを、DB 関数の1往復で行う（004-functions.sql）
+		var reaction RealMojiWithReactor
+		err = h.DB.GetContext(ctx, &reaction, `
+   SELECT id, post_id, reactor_id, image_id, reaction_type, created_at, replaced_at, deleted_at,
+          user_id AS "reactor.id", username AS "reactor.username", secret_key_hash AS "reactor.secret_key_hash",
+          display_name AS "reactor.display_name", bio AS "reactor.bio", profile_image_id AS "reactor.profile_image_id",
+          region AS "reactor.region", account_type AS "reactor.account_type", status AS "reactor.status"
+   FROM isureal_replace_realmoji($1, $2, $3, $4, $5, $6)
+  `, uuid.NewString(), uuid.NewString(), input.PostID, GetSession(c).UserID, data, input.ReactionType)
 		if err != nil {
+			return dbFunctionError(err)
+		}
+		if err := reaction.Reactor.setImageKey(); err != nil {
 			return err
 		}
-		if actor == post.AuthorID {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		// 画像の書き込みが終わるまで、2人分の行ロックは取らない。
-		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES($1,$2,$3,'image/jpeg')`, imageID, actor, data); err != nil {
-			return err
-		}
-		if err := lockRelationshipUsers(ctx, tx, actor, post.AuthorID); err != nil {
-			return err
-		}
-		allowed, err := canViewPost(ctx, tx, actor, post.ID)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE realmojis SET replaced_at=clock_timestamp() WHERE post_id=$1 AND reactor_id=$2 AND replaced_at IS NULL AND deleted_at IS NULL`, post.ID, actor); err != nil {
-			return err
-		}
-		id := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO realmojis(id,post_id,reactor_id,image_id,reaction_type,created_at) VALUES($1,$2,$3,$4,$5,clock_timestamp())`, id, post.ID, actor, imageID, input.ReactionType); err != nil {
-			return err
-		}
-		reaction, err := getRealMoji(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-		user, err := getUser(ctx, tx, actor)
-		if err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-		return c.JSON(http.StatusCreated, newRealMojiResponse(reaction, user))
+		return c.JSON(http.StatusCreated, newRealMojiResponse(reaction.RealMoji, reaction.Reactor))
 	}
 }
 
@@ -171,36 +135,8 @@ func deleteRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		actor := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		var lockedID string
-		if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`, actor); err != nil {
-			return err
-		}
-		var record struct {
-			ReactorID string `db:"reactor_id"`
-			AuthorID  string `db:"author_id"`
-		}
-		err = tx.GetContext(ctx, &record, `SELECT r.reactor_id,p.author_id FROM realmojis r JOIN posts p ON p.id=r.post_id WHERE r.id=$1 AND r.deleted_at IS NULL FOR UPDATE OF r`, input.RealMojiID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "interaction_not_found")
-		}
-		if err != nil {
-			return err
-		}
-		if actor != record.ReactorID && actor != record.AuthorID {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE realmojis SET deleted_at=clock_timestamp() WHERE id=$1`, input.RealMojiID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
+		if _, err := h.DB.ExecContext(c.Request().Context(), `SELECT isureal_delete_realmoji($1, $2)`, input.RealMojiID, GetSession(c).UserID); err != nil {
+			return dbFunctionError(err)
 		}
 		return c.NoContent(http.StatusNoContent)
 	}

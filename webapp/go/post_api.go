@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/labstack/echo/v5"
 )
 
@@ -106,12 +105,8 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
    FROM isureal_create_post($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
   `, uuid.NewString(), uuid.NewString(), userID, imageData, time.Now().UTC(), input.Caption, input.Visibility,
 			location.Kind, location.Latitude, location.Longitude, location.Locality)
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "IR409" {
-			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-		}
 		if err != nil {
-			return err
+			return dbFunctionError(err)
 		}
 		user := row.User
 		if err := user.setImageKey(); err != nil {

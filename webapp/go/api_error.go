@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/labstack/echo/v5"
 )
 
@@ -20,6 +21,23 @@ func (e *APIError) Error() string { return e.Code }
 
 func NewAPIError(status int, code string) error {
 	return &APIError{Status: status, Code: code}
+}
+
+// DB 関数（004-functions.sql）が ERRCODE 'IR4xx' で投げた例外を、MESSAGE をエラーコードとする API エラーに変換する。
+func dbFunctionError(err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return err
+	}
+	switch pgErr.Code {
+	case "IR403":
+		return NewAPIError(http.StatusForbidden, pgErr.Message)
+	case "IR404":
+		return NewAPIError(http.StatusNotFound, pgErr.Message)
+	case "IR409":
+		return NewAPIError(http.StatusConflict, pgErr.Message)
+	}
+	return err
 }
 
 func APIErrorHandler(c *echo.Context, err error) {
