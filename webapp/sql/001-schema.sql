@@ -64,6 +64,8 @@ CREATE TABLE image_objects_202704 PARTITION OF image_objects FOR VALUES FROM ('2
 CREATE TABLE image_objects_202705 PARTITION OF image_objects FOR VALUES FROM ('2027-05-01 00:00:00+00') TO ('2027-06-01 00:00:00+00');
 CREATE TABLE image_objects_202706 PARTITION OF image_objects FOR VALUES FROM ('2027-06-01 00:00:00+00') TO ('2027-07-01 00:00:00+00');
 CREATE TABLE image_objects_default PARTITION OF image_objects DEFAULT;
+-- id 単独の検索が全パーティションの seq scan にならないようにする。主キーは (id, created_at)。
+CREATE INDEX image_objects_id ON image_objects (id);
 
 CREATE TABLE users (
   id varchar(36) PRIMARY KEY,
@@ -82,6 +84,7 @@ CREATE TABLE users (
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+CREATE INDEX users_username ON users (username);
 ALTER TABLE image_objects ADD CONSTRAINT image_objects_owner_fk FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE RESTRICT;
 
 -- 2026-09-10 管理者を消す時のオペレーションはどうすればよいですか？
@@ -102,6 +105,7 @@ CREATE TABLE login_sessions (
   invalidated_at timestamptz,
   reason text
 );
+CREATE INDEX login_sessions_token_hash ON login_sessions (token_hash);
 
 CREATE TABLE administrator_sessions (
   id varchar(36) PRIMARY KEY,
@@ -121,6 +125,7 @@ CREATE TABLE friendships (
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   UNIQUE(user_low_id,user_high_id)
 );
+CREATE INDEX friendships_user_high_id ON friendships (user_high_id);
 
 CREATE TABLE follows (
   id varchar(36) PRIMARY KEY,
@@ -130,6 +135,7 @@ CREATE TABLE follows (
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   UNIQUE(follower_id,followee_id)
 );
+CREATE INDEX follows_followee_id ON follows (followee_id);
 
 CREATE TABLE block_relations (
   id varchar(36) PRIMARY KEY,
@@ -138,6 +144,7 @@ CREATE TABLE block_relations (
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   UNIQUE(blocker_id,blocked_id)
 );
+CREATE INDEX block_relations_blocked_id ON block_relations (blocked_id);
 
 CREATE TABLE posting_windows (
   id varchar(36) PRIMARY KEY,
@@ -168,6 +175,8 @@ CREATE TABLE posts (
 );
 CREATE INDEX posts_author_id ON posts(author_id);
 CREATE INDEX posts_posting_window_id ON posts(posting_window_id);
+CREATE INDEX posts_image_id ON posts (image_id);
+CREATE INDEX posts_posted_at_id ON posts (posted_at, id);
 
 CREATE TABLE friend_requests (
   id varchar(36) PRIMARY KEY,
@@ -177,6 +186,8 @@ CREATE TABLE friend_requests (
   created_at timestamptz NOT NULL,
   updated_at timestamptz NOT NULL
 );
+CREATE INDEX friend_requests_requester_id_status ON friend_requests (requester_id, status);
+CREATE INDEX friend_requests_recipient_id_status ON friend_requests (recipient_id, status);
 
 CREATE TABLE realmojis (
   id varchar(36) PRIMARY KEY,
@@ -190,6 +201,7 @@ CREATE TABLE realmojis (
 );
 CREATE UNIQUE INDEX realmojis_one_active ON realmojis(post_id,reactor_id) WHERE replaced_at IS NULL AND deleted_at IS NULL;
 CREATE INDEX realmojis_post_id ON realmojis(post_id);
+CREATE INDEX realmojis_image_id ON realmojis (image_id);
 
 CREATE TABLE comments (
   id varchar(36) PRIMARY KEY,
@@ -199,7 +211,7 @@ CREATE TABLE comments (
   created_at timestamptz NOT NULL,
   deleted_at timestamptz
 );
-CREATE INDEX comments_post_id ON comments(post_id);
+CREATE INDEX comments_post_id_created_at_id ON comments (post_id, created_at, id);
 
 CREATE TABLE notifications (
   id varchar(36) PRIMARY KEY,
@@ -208,6 +220,7 @@ CREATE TABLE notifications (
   created_at timestamptz NOT NULL,
   UNIQUE(user_id,posting_window_id)
 );
+CREATE INDEX notifications_user_id_created_at ON notifications (user_id, created_at);
 
 CREATE TABLE ip_bans (
   ip text PRIMARY KEY,
