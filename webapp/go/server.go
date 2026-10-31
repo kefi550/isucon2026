@@ -35,7 +35,10 @@ func NewServer(config *Config) *echo.Echo {
 	if err != nil {
 		panic("failed to open database: " + err.Error())
 	}
-	db.SetMaxOpenConns(30)
+	// 合計は DB の max_connections（database/.../conf.d/92-connections.conf）に収めること。
+	// アイドルの上限を同じにしないと、既定の2本を超えた接続が毎回張り直され、遠いリージョンで数往復を失う。
+	db.SetMaxOpenConns(80)
+	db.SetMaxIdleConns(80)
 	err = db.Ping()
 	if err != nil {
 		panic("failed to ping database: " + err.Error())

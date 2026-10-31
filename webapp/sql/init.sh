@@ -27,3 +27,4 @@ run_sql() {
 
 run_sql reset.sql
 run_sql 002-indexes.sql
+run_sql 004-functions.sql

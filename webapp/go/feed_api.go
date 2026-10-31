@@ -10,6 +10,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
+	"golang.org/x/sync/errgroup"
 )
 
 type getFeedRequest struct {
@@ -48,24 +49,45 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
 		ctx := c.Request().Context()
-		viewer, err := loadViewerContext(ctx, h.DB, GetSession(c).UserID)
+		viewerID := GetSession(c).UserID
+		beforePostedAt, beforeID := input.BeforePostedAt, input.BeforeID
+		if ranked {
+			beforePostedAt, beforeID = nil, ""
+		}
+		// 閲覧者の情報・関係・投稿候補は互いに依存しないので、並列に投げて往復1回分の待ちにする
+		var (
+			row       viewerRow
+			relations []viewerRelation
+			posts     []PostWithAuthor
+			following map[string]bool
+		)
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() (err error) {
+			row, err = selectViewerRow(gctx, h.DB, viewerID)
+			return err
+		})
+		g.Go(func() (err error) {
+			relations, err = selectViewerRelations(gctx, h.DB, viewerID)
+			return err
+		})
+		g.Go(func() (err error) {
+			posts, following, err = selectFeedCandidates(gctx, h.DB, viewerID, input.Feed, beforePostedAt, beforeID)
+			return err
+		})
+		err := g.Wait()
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.JSON(http.StatusOK, getFeedResponse{Items: []feedItemResponse{}})
 		}
 		if err != nil {
 			return err
 		}
+		viewer, err := buildViewerContext(row, relations)
+		if err != nil {
+			return err
+		}
 		// 今日まだ投稿していない閲覧者は、自分以外の投稿を一切見られない（canView 参照）
 		if !viewer.HasPostedToday {
 			return c.JSON(http.StatusOK, getFeedResponse{Items: []feedItemResponse{}})
-		}
-		beforePostedAt, beforeID := input.BeforePostedAt, input.BeforeID
-		if ranked {
-			beforePostedAt, beforeID = nil, ""
-		}
-		posts, following, err := selectFeedCandidates(ctx, h.DB, viewer, input.Feed, beforePostedAt, beforeID)
-		if err != nil {
-			return err
 		}
 		candidates := make([]PostWithAuthor, 0)
 		for _, post := range posts {
@@ -105,30 +127,42 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 	}
 }
 
+// フィード候補の SQL で使う、閲覧者（$1）の友達・ブロック相手・友達の友達の ID 配列。
+// 定義は loadViewerContext の Friends / Blocked / FriendsOfFriends と一致させること。
+// IN (SELECT ...) だと全件走査の計画になるため、配列化してインデックスを使わせる。
+const (
+	feedFriendIDs = `ARRAY(SELECT CASE WHEN f.user_low_id = $1 THEN f.user_high_id ELSE f.user_low_id END
+     FROM friendships f WHERE f.user_low_id = $1 OR f.user_high_id = $1)`
+	feedBlockedIDs = `ARRAY(SELECT CASE WHEN b.blocker_id = $1 THEN b.blocked_id ELSE b.blocker_id END
+     FROM block_relations b WHERE b.blocker_id = $1 OR b.blocked_id = $1)`
+	feedFriendsOfFriendsIDs = `ARRAY(
+     SELECT f.user_high_id FROM friendships f WHERE f.user_low_id = ANY(` + feedFriendIDs + `)
+     UNION
+     SELECT f.user_low_id FROM friendships f WHERE f.user_high_id = ANY(` + feedFriendIDs + `))`
+)
+
 // selectFeedCandidates は canView と matchesFeed の条件を SQL に展開して、フィード候補の投稿を取得する。
 // 条件は canView / matchesFeed と完全に一致させること（広いと LIMIT 後に件数が欠け、狭いと投稿が漏れる）。
+// 閲覧者の関係も SQL の中で求めるので、loadViewerContext の結果を待たずに並列で実行できる。
 // 呼び出し側でも canView / matchesFeed で再確認し、権限のない投稿を返さないようにしている。
 // following フィードでは、取得した投稿の作者（=フォロー中のユーザー）を following として返す。
-func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewer viewerContext, feed string, beforePostedAt *time.Time, beforeID string) ([]PostWithAuthor, map[string]bool, error) {
-	friends := userIDList(viewer.Friends, nil)
-	args := []any{viewer.ID, beforePostedAt, beforeID, userIDList(viewer.Blocked, nil)}
+func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID string, feed string, beforePostedAt *time.Time, beforeID string) ([]PostWithAuthor, map[string]bool, error) {
 	var condition string
 	switch feed {
 	case "public":
 		condition = `AND p.visibility = 'public'`
 	case "friends":
-		args = append(args, friends)
-		condition = `AND p.author_id = ANY($5::text[]) AND p.visibility IN ('public', 'friends', 'friends_of_friends')`
+		condition = `AND p.author_id = ANY(` + feedFriendIDs + `) AND p.visibility IN ('public', 'friends', 'friends_of_friends')`
 	case "following":
-		args = append(args, friends, userIDList(viewer.FriendsOfFriends, nil))
 		condition = `AND p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)
    AND (p.visibility = 'public'
-     OR (p.visibility IN ('friends', 'friends_of_friends') AND p.author_id = ANY($5::text[]))
-     OR (p.visibility = 'friends_of_friends' AND p.author_id = ANY($6::text[])))`
+     OR (p.visibility IN ('friends', 'friends_of_friends') AND p.author_id = ANY(` + feedFriendIDs + `))
+     OR (p.visibility = 'friends_of_friends' AND p.author_id = ANY(` + feedFriendsOfFriendsIDs + `)))`
 	case "friends-of-friends":
-		// 友達の友達のうち、友達本人と閲覧者自身を除いたユーザー
-		args = append(args, userIDList(viewer.FriendsOfFriends, func(id string) bool { return !viewer.Friends[id] && id != viewer.ID }))
-		condition = `AND p.author_id = ANY($5::text[]) AND p.visibility IN ('public', 'friends_of_friends')`
+		// 友達の友達のうち、友達本人と閲覧者自身を除いたユーザー（閲覧者自身は共通条件で除く）
+		condition = `AND p.author_id = ANY(` + feedFriendsOfFriendsIDs + `)
+   AND NOT (p.author_id = ANY(` + feedFriendIDs + `))
+   AND p.visibility IN ('public', 'friends_of_friends')`
 	default:
 		return nil, nil, nil
 	}
@@ -137,12 +171,23 @@ func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewer vi
 		// スコア順に並べ替えるため候補を全件取る
 		limit = ``
 	}
+	// 退会済み、または今日まだ投稿していない閲覧者には何も返さない（呼び出し側は空のフィードを返す）
 	posts, err := selectPostsWithAuthor(ctx, db, `
+   AND EXISTS (
+     SELECT 1 FROM users vu WHERE vu.id = $1 AND vu.status = 'active'
+       AND EXISTS (
+         SELECT 1 FROM posts vp
+         JOIN posting_windows posted ON posted.id = vp.posting_window_id
+         JOIN posting_windows cur ON cur.region = vu.region AND cur.ended_at IS NULL
+                                 AND cur.local_date = posted.local_date
+         WHERE vp.author_id = vu.id AND vp.deleted_at IS NULL
+       )
+   )
    AND p.author_id <> $1 AND w.ended_at IS NULL
-   AND NOT (p.author_id = ANY($4::text[]))
+   AND NOT (p.author_id = ANY(`+feedBlockedIDs+`))
    AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))
    `+condition+`
-   ORDER BY p.posted_at DESC, p.id DESC`+limit, args...)
+   ORDER BY p.posted_at DESC, p.id DESC`+limit, viewerID, beforePostedAt, beforeID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -153,18 +198,6 @@ func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewer vi
 		}
 	}
 	return posts, following, nil
-}
-
-// userIDList は集合を SQL の配列パラメータ用のスライスに変換する。
-// nil スライスは SQL の NULL になり ANY / NOT ANY の結果が壊れるため、必ず空でない（非 nil の）スライスを返す。
-func userIDList(set map[string]bool, keep func(string) bool) []string {
-	ids := make([]string, 0, len(set))
-	for id, ok := range set {
-		if ok && (keep == nil || keep(id)) {
-			ids = append(ids, id)
-		}
-	}
-	return ids
 }
 
 func rankedBefore(score int64, post Post, beforeScore int64, beforePostedAt time.Time, beforeID string) bool {
@@ -189,24 +222,11 @@ func recommendationScores(ctx context.Context, db sqlx.QueryerContext, viewer vi
 		postIDs = append(postIDs, post.ID)
 	}
 
-	query, args, err := sqlx.In(`SELECT user_low_id, user_high_id FROM friendships WHERE user_low_id IN (?) OR user_high_id IN (?)`, authorIDs, authorIDs)
+	friendshipsQuery, friendshipsArgs, err := sqlx.In(`SELECT user_low_id, user_high_id FROM friendships WHERE user_low_id IN (?) OR user_high_id IN (?)`, authorIDs, authorIDs)
 	if err != nil {
 		return nil, err
 	}
-	var friendships []struct {
-		UserLowID  string `db:"user_low_id"`
-		UserHighID string `db:"user_high_id"`
-	}
-	if err := sqlx.SelectContext(ctx, db, &friendships, sqlx.Rebind(sqlx.DOLLAR, query), args...); err != nil {
-		return nil, err
-	}
-	connections := map[string]int64{}
-	for _, friendship := range friendships {
-		connections[friendship.UserLowID] += int64(viewer.MutualFriends[friendship.UserHighID])
-		connections[friendship.UserHighID] += int64(viewer.MutualFriends[friendship.UserLowID])
-	}
-
-	query, args, err = sqlx.In(`
+	engagementsQuery, engagementsArgs, err := sqlx.In(`
   SELECT r.post_id, r.reactor_id AS user_id FROM realmojis r
   JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
   WHERE r.post_id IN (?) AND r.replaced_at IS NULL AND r.deleted_at IS NULL
@@ -218,13 +238,31 @@ func recommendationScores(ctx context.Context, db sqlx.QueryerContext, viewer vi
 	if err != nil {
 		return nil, err
 	}
+	var friendships []struct {
+		UserLowID  string `db:"user_low_id"`
+		UserHighID string `db:"user_high_id"`
+	}
 	var engagements []struct {
 		PostID string `db:"post_id"`
 		UserID string `db:"user_id"`
 	}
-	if err := sqlx.SelectContext(ctx, db, &engagements, sqlx.Rebind(sqlx.DOLLAR, query), args...); err != nil {
+	// 2本は互いに依存しないので並列に投げる（db はトランザクションではなく接続プールであること）
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return sqlx.SelectContext(gctx, db, &friendships, sqlx.Rebind(sqlx.DOLLAR, friendshipsQuery), friendshipsArgs...)
+	})
+	g.Go(func() error {
+		return sqlx.SelectContext(gctx, db, &engagements, sqlx.Rebind(sqlx.DOLLAR, engagementsQuery), engagementsArgs...)
+	})
+	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+	connections := map[string]int64{}
+	for _, friendship := range friendships {
+		connections[friendship.UserLowID] += int64(viewer.MutualFriends[friendship.UserHighID])
+		connections[friendship.UserHighID] += int64(viewer.MutualFriends[friendship.UserLowID])
+	}
+
 	friendEngagements := map[string]int64{}
 	for _, engagement := range engagements {
 		if viewer.Friends[engagement.UserID] {

@@ -111,14 +111,33 @@ var viewerUserColumns = func() string {
 }()
 
 func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID string) (viewerContext, error) {
-	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}, Blocked: map[string]bool{}}
-
-	// ユーザー情報と「今日投稿済みか」を1往復で取得する（リージョン間の往復回数を減らすため）
-	var row struct {
-		User
-		HasPostedToday bool `db:"has_posted_today"`
+	row, err := selectViewerRow(ctx, db, viewerID)
+	if err != nil {
+		return viewerContext{}, err
 	}
-	if err := sqlx.GetContext(ctx, db, &row, `
+	relations, err := selectViewerRelations(ctx, db, viewerID)
+	if err != nil {
+		return viewerContext{}, err
+	}
+	return buildViewerContext(row, relations)
+}
+
+type viewerRow struct {
+	User
+	HasPostedToday bool `db:"has_posted_today"`
+}
+
+// kind='b' は相手のユーザーID（first_id）、kind='f' は friendships の1行（low, high）を表す。
+type viewerRelation struct {
+	Kind     string `db:"kind"`
+	FirstID  string `db:"first_id"`
+	SecondID string `db:"second_id"`
+}
+
+// ユーザー情報と「今日投稿済みか」を1往復で取得する（リージョン間の往復回数を減らすため）
+func selectViewerRow(ctx context.Context, db sqlx.QueryerContext, viewerID string) (viewerRow, error) {
+	var row viewerRow
+	err := sqlx.GetContext(ctx, db, &row, `
   SELECT `+viewerUserColumns+`,
     EXISTS(
       SELECT 1 FROM posts p
@@ -128,24 +147,15 @@ func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID str
       WHERE p.author_id = u.id AND p.deleted_at IS NULL
     ) AS has_posted_today
   FROM users u WHERE u.id = $1 AND u.status = 'active'
- `, viewerID); err != nil {
-		return viewer, err
-	}
-	viewer.User = row.User
-	viewer.HasPostedToday = row.HasPostedToday
-	if err := viewer.User.setImageKey(); err != nil {
-		return viewer, err
-	}
+ `, viewerID)
+	return row, err
+}
 
-	// ブロック関係と、友達・友達の友達の算出に必要な友達関係を1往復で取得する。
-	// kind='b' は相手のユーザーID（first_id）、kind='f' は friendships の1行（low, high）を表す。
-	// 友達の友達関係には viewer 自身との関係も必ず含まれるため、そこから友達一覧も復元できる。
-	var relations []struct {
-		Kind     string `db:"kind"`
-		FirstID  string `db:"first_id"`
-		SecondID string `db:"second_id"`
-	}
-	if err := sqlx.SelectContext(ctx, db, &relations, `
+// ブロック関係と、友達・友達の友達の算出に必要な友達関係を1往復で取得する。
+// 友達の友達関係には viewer 自身との関係も必ず含まれるため、そこから友達一覧も復元できる。
+func selectViewerRelations(ctx context.Context, db sqlx.QueryerContext, viewerID string) ([]viewerRelation, error) {
+	var relations []viewerRelation
+	err := sqlx.SelectContext(ctx, db, &relations, `
   WITH friend_ids AS (
     SELECT CASE WHEN user_low_id = $1 THEN user_high_id ELSE user_low_id END AS id
     FROM friendships WHERE user_low_id = $1 OR user_high_id = $1
@@ -157,7 +167,15 @@ func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID str
   FROM friendships
   -- IN (SELECT ...) だと全件走査の計画になるため、配列化してインデックス（low 側の UNIQUE と friendships_user_high_id）を使わせる
   WHERE user_low_id = ANY(ARRAY(SELECT id FROM friend_ids)) OR user_high_id = ANY(ARRAY(SELECT id FROM friend_ids))
- `, viewer.ID); err != nil {
+ `, viewerID)
+	return relations, err
+}
+
+func buildViewerContext(row viewerRow, relations []viewerRelation) (viewerContext, error) {
+	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}, Blocked: map[string]bool{}}
+	viewer.User = row.User
+	viewer.HasPostedToday = row.HasPostedToday
+	if err := viewer.User.setImageKey(); err != nil {
 		return viewer, err
 	}
 	type friendshipPair struct{ UserLowID, UserHighID string }

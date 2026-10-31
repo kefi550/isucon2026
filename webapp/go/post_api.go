@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/labstack/echo/v5"
 )
 
@@ -86,73 +87,40 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
+		// 画像の保存からスロットの確認、投稿の INSERT までを、DB 関数の1往復で行う（004-functions.sql）
+		var row struct {
+			User
+			PostID          string `db:"post_id"`
+			PostingWindowID string `db:"posting_window_id"`
+			PostImageID     string `db:"image_id"`
+			Caption         string `db:"caption"`
+			Visibility      string `db:"visibility"`
+			PostLocation
+			PostedAt       time.Time `db:"posted_at"`
+			OnTimeDeadline time.Time `db:"on_time_deadline"`
 		}
-		defer tx.Rollback()
-		// 画像の書き込みは行ロックを取らない。スロットの確認だけ、ロックのあとで行う。
-		postedAt := time.Now().UTC()
-		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, $3, 'image/jpeg', $4)`, imageID, userID, imageData, postedAt); err != nil {
-			return err
-		}
-		var lockedUserID string
-		if err := tx.GetContext(ctx, &lockedUserID, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID); err != nil {
-			return err
-		}
-		user, err := getUser(ctx, tx, userID)
-		if err != nil {
-			return err
-		}
-		var window struct {
-			ID        string    `db:"id"`
-			LocalDate time.Time `db:"local_date"`
-			StartsAt  time.Time `db:"starts_at"`
-		}
-		// FOR SHARE は同じ期間への投稿を並列に通す。期間を閉じる UPDATE は FOR NO KEY UPDATE なので、
-		// 終了処理とは引き続き競合し、ended_at 設定後の投稿は通らない。
-		const openWindowQuery = `SELECT id, local_date, starts_at FROM posting_windows WHERE region = $1 AND ended_at IS NULL FOR SHARE`
-		err = tx.GetContext(ctx, &window, openWindowQuery, user.Region)
-		if errors.Is(err, sql.ErrNoRows) {
-			err = tx.GetContext(ctx, &window, openWindowQuery, user.Region)
-		}
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-			}
-			return err
-		}
-		var counts struct {
-			Active  int `db:"active"`
-			Deleted int `db:"deleted"`
-		}
-		if err := tx.GetContext(ctx, &counts, `
-   SELECT count(*) FILTER (WHERE deleted_at IS NULL) AS active,
-          count(*) FILTER (WHERE deleted_at IS NOT NULL) AS deleted
-   FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
-   WHERE p.author_id = $1 AND w.local_date = $2
-  `, userID, window.LocalDate); err != nil {
-			return err
-		}
-		if counts.Active != 0 || counts.Deleted >= 2 || postedAt.Before(window.StartsAt) {
+		err = h.DB.GetContext(ctx, &row, `
+   SELECT user_id AS id, username, secret_key_hash, display_name, bio, profile_image_id, region, account_type, status,
+          post_id, posting_window_id, image_id, caption, visibility, location_kind, latitude, longitude, locality,
+          posted_at, on_time_deadline
+   FROM isureal_create_post($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+  `, uuid.NewString(), uuid.NewString(), userID, imageData, time.Now().UTC(), input.Caption, input.Visibility,
+			location.Kind, location.Latitude, location.Longitude, location.Locality)
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "IR409" {
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
 		}
-		postID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `
-   INSERT INTO posts (id, author_id, posting_window_id, image_id, caption, visibility,
-                      location_kind, latitude, longitude, locality, posted_at)
-   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-  `, postID, userID, window.ID, imageID, input.Caption, input.Visibility,
-			location.Kind, location.Latitude, location.Longitude, location.Locality, postedAt); err != nil {
-			return err
-		}
-		post, err := getPost(ctx, tx, postID)
 		if err != nil {
 			return err
 		}
-		if err := tx.Commit(); err != nil {
+		user := row.User
+		if err := user.setImageKey(); err != nil {
 			return err
+		}
+		post := Post{
+			ID: row.PostID, AuthorID: user.ID, PostingWindowID: row.PostingWindowID, ImageID: row.PostImageID,
+			Caption: row.Caption, Visibility: row.Visibility, PostLocation: row.PostLocation,
+			PostedAt: row.PostedAt, OnTimeDeadline: row.OnTimeDeadline,
 		}
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))
 	}
