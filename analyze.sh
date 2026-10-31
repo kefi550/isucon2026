@@ -8,6 +8,10 @@ for i in $(seq 1 3); do
   ssh ${host} "cat /var/log/nginx/access.log | alp ltsv -m '/api/images/[^/]+','/api/users/[^/]+','/api/posts/[^/]+','/api/follows/[^/]+','/api/friend-requests/[^/]+','/api/comments/[^/]+','/api/memories/[^/]+','/api/admin/users/[^/]+/certification','/api/realmojis/[^/]+','/api/blocks/[^/]+'"
 done
 
+# DB の集計は、計測を止めている間（pg_stat_statements と log_lock_waits を無効にしている）は使えない。
+# 計測を戻したときだけ ANALYZE_DB=1 で実行する。
+if [ "${ANALYZE_DB:-0}" = 1 ]; then
+
 # pg_stat_statements の上位。件数は PGSS_TOP で変えられる。
 # hit_pct は共有バッファに載っていた割合、read_blks と read_ms はディスクから読んだブロック数と時間。
 echo database
@@ -111,3 +115,5 @@ END {
     printf "%8.0f ms  n=%-5d max=%6.0f  %s\n", total[k], cnt[k], mx[k], k
 }
 ' "$relmap" - | sort -nr | head -n "$lock_top"
+
+fi

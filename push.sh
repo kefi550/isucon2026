@@ -13,5 +13,4 @@ for i in $(seq 1 3); do
   ssh ${host} 'bash -l -c "sudo logrotate -f /etc/logrotate.conf; export PATH=/home/isucon/local/go/bin:/home/isucon/go/bin:\$PATH; cd ~/webapp/go; rm -f isureal; go build -o isureal ./cmd/isureal; sudo systemctl restart isureal-go.service;"'
 done
 
-echo database
-ssh database "sudo -u postgres psql -d isureal -X -q -c 'SELECT pg_stat_statements_reset();'"
+# database: 計測（pg_stat_statements）を止めているので、リセットはしない。
