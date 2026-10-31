@@ -65,7 +65,7 @@ func getSessionFromHeader(c *echo.Context, db *sqlx.DB) (*Session, error) {
 func SessionMiddleware(handlerContext *HandlerContext, authRequired bool) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) error {
-			session, err := getSessionFromHeader(c, handlerContext.DB)
+			session, err := getSessionFromHeader(c, handlerContext.sessionDB())
 			if err != nil {
 				return err
 			}
@@ -155,4 +155,12 @@ func getLoginSession(ctx context.Context, db sqlx.QueryerContext, sessionID stri
 		return nil, fmt.Errorf("failed to get session: %w", err)
 	}
 	return &session, nil
+}
+
+// sessionDB はセッション確認に使う接続プールを返す（専用のプールが無ければ通常のプール）
+func (h *HandlerContext) sessionDB() *sqlx.DB {
+	if h.SessionDB != nil {
+		return h.SessionDB
+	}
+	return h.DB
 }

@@ -17,8 +17,10 @@ type HandlerContext struct {
 	DB *sqlx.DB
 	// ImageDB は画像取得専用の接続プール（計画を使い回す設定）。nil のときは DB を使う。
 	ImageDB *sqlx.DB
-	Config  *Config
-	IPBans  *IPBanList
+	// SessionDB はセッション確認専用の接続プール。nil のときは DB を使う。
+	SessionDB *sqlx.DB
+	Config    *Config
+	IPBans    *IPBanList
 
 	notificationOnce sync.Once
 	notifications    *notificationBroker
@@ -40,7 +42,7 @@ func NewServer(config *Config) *echo.Echo {
 		panic("failed to open database: " + err.Error())
 	}
 	// 合計は DB の max_connections（database/.../conf.d/92-connections.conf の300）に収めること。
-	// 通常の上限は config.DBMaxConns（asia 24、europe と america 30）。画像用の5本を足して、3台で 29 + 35 + 35 = 99 本。
+	// 通常の上限は config.DBMaxConns（asia 24、europe と america 30）。画像用の5本とセッション用の6本を足す（asia 24 + 11、europe と america 30 + 11）。
 	// 本数は DB のメモリでも決まる。待機中の接続も1本ごとにメモリを持ち、約190本でメモリが尽きた。
 	// アイドルの上限を同じにしないと、既定の2本を超えた接続が毎回張り直され、遠いリージョンで数往復を失う。
 	db.SetMaxOpenConns(config.DBMaxConns)
@@ -61,18 +63,31 @@ func NewServer(config *Config) *echo.Echo {
 		panic("failed to ping image database: " + err.Error())
 	}
 
+	// セッション確認専用の接続プール。確認のクエリは 0.04ms ほどで終わるが、認証が要る全リクエストが最初に通る。
+	// 通常のプールで投稿の取得などの重いクエリと同じ列に並ぶと、数十 ms 待たされることがあったので、別に持つ。
+	sessionDB, err := sqlx.Open("pgx", config.DatabaseDSN())
+	if err != nil {
+		panic("failed to open session database: " + err.Error())
+	}
+	sessionDB.SetMaxOpenConns(config.SessionDBConns)
+	sessionDB.SetMaxIdleConns(config.SessionDBConns)
+	if err := sessionDB.Ping(); err != nil {
+		panic("failed to ping session database: " + err.Error())
+	}
+
 	// 接続プールの統計（空き待ちの回数・時間など）を 127.0.0.1:6060/debug/vars に出す。profile.sh が読む。
 	if expvar.Get("db_pools") == nil {
 		expvar.Publish("db_pools", expvar.Func(func() any {
-			return map[string]sql.DBStats{"main": db.Stats(), "image": imageDB.Stats()}
+			return map[string]sql.DBStats{"main": db.Stats(), "image": imageDB.Stats(), "session": sessionDB.Stats()}
 		}))
 	}
 
 	handlerContext := &HandlerContext{
-		DB:      db,
-		ImageDB: imageDB,
-		Config:  config,
-		IPBans:  &IPBanList{},
+		DB:        db,
+		ImageDB:   imageDB,
+		SessionDB: sessionDB,
+		Config:    config,
+		IPBans:    &IPBanList{},
 	}
 	e.Use(IPBanMiddleware(handlerContext))
 
