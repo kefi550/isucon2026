@@ -45,13 +45,7 @@ func openSecondTestDB(t *testing.T, base *sqlx.DB, name string) *sqlx.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	schema, err := os.ReadFile("../sql/001-schema.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(string(schema)); err != nil {
-		t.Fatalf("スキーマ作成に失敗: %v", err)
-	}
+	applyTestSchema(t, db)
 	return db
 }
 

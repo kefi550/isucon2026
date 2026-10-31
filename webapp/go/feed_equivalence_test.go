@@ -48,14 +48,28 @@ func openTestDB(t *testing.T) *sqlx.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	schema, err := os.ReadFile("../sql/001-schema.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(string(schema)); err != nil {
-		t.Fatalf("スキーマ作成に失敗: %v", err)
-	}
+	applyTestSchema(t, db)
 	return db
+}
+
+// applyTestSchema は、本番の DB と同じ形になるよう、スキーマ・インデックス・DB 関数を順に流す。
+// 本番では最初の準備（003-initial-snapshot.sql）で作られる initial_data_boundary も、
+// テストのデータがすべて「初期データより新しい」扱いになるよう、十分古い時刻で作る。
+func applyTestSchema(t *testing.T, db *sqlx.DB) {
+	t.Helper()
+	for _, file := range []string{"../sql/001-schema.sql", "../sql/002-indexes.sql", "../sql/004-functions.sql"} {
+		sqlText, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(string(sqlText)); err != nil {
+			t.Fatalf("%s の実行に失敗: %v", file, err)
+		}
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS initial_data_boundary;
+		CREATE TABLE initial_data_boundary AS SELECT timestamptz '2000-01-01 00:00:00+00' AS created_at;`); err != nil {
+		t.Fatalf("initial_data_boundary の作成に失敗: %v", err)
+	}
 }
 
 // seed は乱数（シード固定）でユーザー・関係・投稿期間・投稿・リアクションを作る

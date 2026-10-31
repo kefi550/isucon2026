@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jmoiron/sqlx"
 )
 
@@ -60,6 +61,9 @@ type notificationBroker struct {
 func (h *HandlerContext) notificationHub() *notificationBroker {
 	h.notificationOnce.Do(func() {
 		h.notifications = newNotificationBroker(h.DB)
+		if h.Config != nil {
+			go h.notifications.listenPostingWindows(h.Config.DatabaseDSN())
+		}
 	})
 	return h.notifications
 }
@@ -72,6 +76,38 @@ func newNotificationBroker(db *sqlx.DB) *notificationBroker {
 	}
 	go broker.loop()
 	return broker
+}
+
+// postingWindowOpenedChannel は、投稿期間が開いたことを知らせる LISTEN/NOTIFY のチャンネル名
+const postingWindowOpenedChannel = "posting_window_opened"
+
+// listenPostingWindows は、接続プールとは別の専用接続で LISTEN し、投稿期間が開いた知らせが来たら見回りを起こす。
+// 接続が切れたら少し待ってつなぎ直す。その間も500ms ごとの見回りは続くので、通知が届かなくなることはない。
+func (b *notificationBroker) listenPostingWindows(dsn string) {
+	for {
+		if err := b.listenOnce(dsn); err != nil {
+			slog.Error("failed to listen posting windows", "error", err)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func (b *notificationBroker) listenOnce(dsn string) error {
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, "LISTEN "+postingWindowOpenedChannel); err != nil {
+		return err
+	}
+	for {
+		if _, err := conn.WaitForNotification(ctx); err != nil {
+			return err
+		}
+		b.wakePoll()
+	}
 }
 
 // windowMayNotify は、開いている投稿期間の通知がこの接続の対象になり得るかを返す。
@@ -177,38 +213,19 @@ func (b *notificationBroker) pollWindows(ctx context.Context) {
 }
 
 func (b *notificationBroker) pollRegion(ctx context.Context, region string, subs []*notificationSub) error {
-	var windows []struct {
-		ID       string    `db:"id"`
-		StartsAt time.Time `db:"starts_at"`
-	}
-	if err := b.db.SelectContext(ctx, &windows, `
-		SELECT id, starts_at
-		FROM posting_windows
-		WHERE region = $1 AND ended_at IS NULL
-		ORDER BY starts_at, id
-	`, region); err != nil {
+	// 開いている投稿期間・待っている利用者の状態・通知の行を1往復で取る（europe/america では1往復が約100ms）
+	window, users, notes, err := loadRegionNotificationState(ctx, b.db, region, subscriberUserIDs(subs))
+	if err != nil {
 		return err
 	}
-	if len(windows) == 0 {
+	if window == nil {
 		return nil
 	}
-	window := windows[0]
 	eligible := make([]*notificationSub, 0, len(subs))
 	for _, sub := range subs {
 		if windowMayNotify(sub.connectedAt, window.StartsAt) {
 			eligible = append(eligible, sub)
 		}
-	}
-	if len(eligible) == 0 {
-		return nil
-	}
-	users, err := selectNotificationUsers(ctx, b.db, subscriberUserIDs(eligible))
-	if err != nil {
-		return err
-	}
-	notes, err := selectOpenWindowNotifications(ctx, b.db, window.ID)
-	if err != nil {
-		return err
 	}
 	for _, sub := range eligible {
 		user, ok := users[sub.userID]
@@ -282,6 +299,75 @@ func selectNotificationUsers(ctx context.Context, db sqlx.QueryerContext, ids []
 		}
 	}
 	return users, nil
+}
+
+// openWindow は、あるリージョンで開いている投稿期間
+type openWindow struct {
+	ID       string
+	StartsAt time.Time
+}
+
+// loadRegionNotificationState は、リージョンで開いている投稿期間（最も古いもの）と、指定した利用者の状態、
+// その投稿期間の各利用者の通知の行を、1本のクエリで取る。
+// 結果は、従来の3本（開いている投稿期間・selectNotificationUsers・selectOpenWindowNotifications）と同じ。
+// 投稿期間が開いていなければ window は nil。
+func loadRegionNotificationState(ctx context.Context, db sqlx.QueryerContext, region string, userIDs []string) (*openWindow, map[string]notificationUser, map[string]notificationRow, error) {
+	if userIDs == nil {
+		userIDs = []string{}
+	}
+	var rows []struct {
+		WindowID     string     `db:"window_id"`
+		StartsAt     time.Time  `db:"starts_at"`
+		WindowRegion string     `db:"window_region"`
+		UserID       *string    `db:"user_id"`
+		UserRegion   *string    `db:"user_region"`
+		UserStatus   *string    `db:"user_status"`
+		SubUserID    *string    `db:"sub_user_id"`
+		NoteID       *string    `db:"note_id"`
+		NoteCreated  *time.Time `db:"note_created_at"`
+	}
+	if err := sqlx.SelectContext(ctx, db, &rows, `
+		WITH w AS (
+			SELECT id, starts_at, region
+			FROM posting_windows
+			WHERE region = $1 AND ended_at IS NULL
+			ORDER BY starts_at, id
+			LIMIT 1
+		)
+		SELECT w.id AS window_id, w.starts_at, w.region AS window_region, s.uid AS sub_user_id,
+		       u.id AS user_id, u.region AS user_region, u.status AS user_status,
+		       n.id AS note_id, n.created_at AS note_created_at
+		FROM w
+		LEFT JOIN unnest($2::text[]) AS s(uid) ON true
+		LEFT JOIN users u ON u.id = s.uid
+		LEFT JOIN LATERAL (
+			SELECT n.id, n.created_at
+			FROM notifications n
+			WHERE n.posting_window_id = w.id AND n.user_id = s.uid
+			ORDER BY n.created_at, n.id
+			LIMIT 1
+		) n ON true
+	`, region, userIDs); err != nil {
+		return nil, nil, nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil, nil, nil
+	}
+	window := &openWindow{ID: rows[0].WindowID, StartsAt: rows[0].StartsAt}
+	users := make(map[string]notificationUser, len(rows))
+	notes := make(map[string]notificationRow, len(rows))
+	for _, row := range rows {
+		if row.UserID != nil {
+			users[*row.UserID] = notificationUser{ID: *row.UserID, Region: *row.UserRegion, Status: *row.UserStatus}
+		}
+		if row.SubUserID != nil && row.NoteID != nil {
+			notes[*row.SubUserID] = notificationRow{
+				UserID: *row.SubUserID, ID: *row.NoteID, PostingWindowID: row.WindowID,
+				Region: row.WindowRegion, CreatedAt: *row.NoteCreated,
+			}
+		}
+	}
+	return window, users, notes, nil
 }
 
 func selectOpenWindowNotifications(ctx context.Context, db sqlx.QueryerContext, windowID string) (map[string]notificationRow, error) {

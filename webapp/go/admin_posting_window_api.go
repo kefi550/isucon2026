@@ -103,9 +103,16 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		// 各サーバーの通知の broker に、投稿期間が開いたことを知らせる（LISTEN している接続へ、COMMIT のときに配られる）。
+		// 知らせを受けた broker は、500ms ごとの見回りを待たずにすぐ通知を配る。
+		if _, err := tx.ExecContext(ctx, `SELECT pg_notify($1, $2)`, postingWindowOpenedChannel, region); err != nil {
+			return err
+		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		// このサーバー（管理者の API を受けるのは isu1）の broker は、DB からの知らせを待たずに起こす
+		h.notificationHub().wakePoll()
 		return c.JSON(http.StatusCreated, openPostingWindowResponse{
 			ID: window.ID, Region: window.Region, LocalDate: window.LocalDate.Format(time.DateOnly),
 			StartsAt: window.StartsAt, OnTimeDeadline: window.OnTimeDeadline,
