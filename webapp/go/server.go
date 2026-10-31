@@ -1,6 +1,8 @@
 package isureal
 
 import (
+	"database/sql"
+	"expvar"
 	"os"
 	"sync"
 
@@ -57,6 +59,13 @@ func NewServer(config *Config) *echo.Echo {
 	imageDB.SetMaxIdleConns(5)
 	if err := imageDB.Ping(); err != nil {
 		panic("failed to ping image database: " + err.Error())
+	}
+
+	// 接続プールの統計（空き待ちの回数・時間など）を 127.0.0.1:6060/debug/vars に出す。profile.sh が読む。
+	if expvar.Get("db_pools") == nil {
+		expvar.Publish("db_pools", expvar.Func(func() any {
+			return map[string]sql.DBStats{"main": db.Stats(), "image": imageDB.Stats()}
+		}))
 	}
 
 	handlerContext := &HandlerContext{

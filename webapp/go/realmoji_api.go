@@ -28,7 +28,7 @@ type replaceRealMojiResponse struct {
 }
 
 func newRealMojiResponse(reaction RealMoji, user User) replaceRealMojiResponse {
-	return replaceRealMojiResponse{ID: reaction.ID, Reactor: newRelationshipUserResponse(user), ReactionType: reaction.ReactionType, ImageURL: signedImageURL(user, reaction.ImageID), CreatedAt: reaction.CreatedAt}
+	return replaceRealMojiResponse{ID: reaction.ID, Reactor: newRelationshipUserResponse(user), ReactionType: reaction.ReactionType, ImageURL: signedImageURLFor("realmoji", user, reaction.ImageID), CreatedAt: reaction.CreatedAt}
 }
 
 func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {

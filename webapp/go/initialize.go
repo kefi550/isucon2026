@@ -1,6 +1,7 @@
 package isureal
 
 import (
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ type initializeResponse struct {
 
 func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
+		clearImagePresign()
 		clearImageSignatureCache()
 		clearImageCreatedAtCache()
 		cmd := exec.Command("../sql/init.sh")
@@ -30,6 +32,11 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		clearImageSignatureCache()
 		clearImageCreatedAtCache()
+		resetImageSignMisses()
+		// 先に署名しておくのは速くするためだけなので、失敗しても初期化は成功させる。
+		if err := runImagePresign(c.Request().Context(), h.DB, h.Config); err != nil {
+			slog.Error("failed to presign images", "error", err)
+		}
 
 		// Set language to the implementation language.
 		// Agents optimizing this app: set agent, harness, and model to the names used.

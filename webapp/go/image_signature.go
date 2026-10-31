@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"expvar"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -18,8 +19,15 @@ const imageURLLifetime = 24 * time.Hour
 const imageSignatureIterations = 1000
 
 // 同じ鍵と画像の URL は、発行からこの秒数のあいだ使い回す。exp は now+24h より最大でこの秒数だけ前になる。
-// 先（切り上げ）にずらすと、1時間単位でベンチに範囲外とされた。
-const imageURLReuseSeconds = 60
+// 初期化の直後に先に署名した URL（image_presign.go）を、ベンチの最後（約80秒後）まで使えるようにする。
+// 600 秒はベンチに通った。先（切り上げ）にずらすと、1時間単位でベンチに範囲外とされた。
+const imageURLReuseSeconds = 300
+
+// 署名付き URL を使い回せた回数と、リクエストの中で計算した回数。/debug/vars に出し、profile.sh が読む。
+var (
+	imageSignHits   = expvar.NewInt("image_sign_hits")
+	imageSignMisses = expvar.NewInt("image_sign_misses")
+)
 
 func imageSigningKey(secretKeyHash string) ([]byte, error) {
 	key, err := hex.DecodeString(secretKeyHash)
@@ -123,6 +131,9 @@ func imageSignature(key []byte, imageID string, exp int64) []byte {
 			return entry.sig
 		}
 	}
+	if sig, ok := lookupPresignedSignature(key, imageID, exp); ok {
+		return sig
+	}
 	// 発行していない exp は保存しない。不正な URL でキャッシュを増やさない。
 	return computeImageSignature(key, imageID, exp)
 }
@@ -136,26 +147,53 @@ func formatSignedImageURL(imageID string, exp int64, sig []byte) string {
 }
 
 func signedImageURL(user User, imageID string) string {
-	return signedImageURLAt(user, imageID, time.Now())
+	return signedImageURLFor("other", user, imageID)
+}
+
+// kind（post / realmoji / profile）は、使い回せなかったときの記録（image_sign_misses.go）に使う。
+func signedImageURLFor(kind string, user User, imageID string) string {
+	url, computed := signedImageURLAtWithResult(user, imageID, time.Now())
+	if computed {
+		recordImageSignMiss(kind, imageID)
+	}
+	return url
 }
 
 func signedImageURLAt(user User, imageID string, now time.Time) string {
-	exp := imageSignatureExpiry(now)
-	cacheKey, ok := newImageSignatureCacheKey(user.ImageKey, imageID, exp)
+	url, _ := signedImageURLAtWithResult(user, imageID, now)
+	return url
+}
+
+func signedImageURLAtWithResult(user User, imageID string, now time.Time) (string, bool) {
+	url, computed := issueImageURL(user.ImageKey, imageID, imageSignatureExpiry(now))
+	if computed {
+		imageSignMisses.Add(1)
+	} else {
+		imageSignHits.Add(1)
+	}
+	return url, computed
+}
+
+// issueImageURL は使い回せる URL があればそれを返し、なければ計算して保存する。2つ目は計算を待ったかどうか。
+func issueImageURL(key []byte, imageID string, exp int64) (string, bool) {
+	cacheKey, ok := newImageSignatureCacheKey(key, imageID, exp)
 	if !ok {
-		return formatSignedImageURL(imageID, exp, computeImageSignature(user.ImageKey, imageID, exp))
+		return formatSignedImageURL(imageID, exp, computeImageSignature(key, imageID, exp)), true
 	}
 	if url, ok := loadIssuedImageURL(cacheKey); ok {
-		return url
+		return url, false
+	}
+	if url, ok := lookupPresignedImageURL(key, imageID, exp); ok {
+		return url, false
 	}
 	value, _, _ := imageSignatureFlight.Do(cacheKey.flightKey(), func() (any, error) {
 		if url, ok := loadIssuedImageURL(cacheKey); ok {
 			return url, nil
 		}
-		sig := computeImageSignature(user.ImageKey, imageID, exp)
+		sig := computeImageSignature(key, imageID, exp)
 		entry := imageSignatureCacheEntry{exp: exp, sig: sig, url: formatSignedImageURL(imageID, exp, sig)}
 		storeImageSignature(cacheKey, entry)
 		return entry.url, nil
 	})
-	return value.(string)
+	return value.(string), true
 }

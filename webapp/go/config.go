@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -17,6 +18,11 @@ type Config struct {
 	LogLevel   string
 	// DB への接続数の上限（open と idle の両方）
 	DBMaxConns int
+	// 初期化のときに画像の署名を先に計算する（image_presign.go）。
+	// PresignLocalItems 件を自分で計算してから初期化の応答を返し、残りは PresignWorkers（ssh 先）に分けて任せる。
+	// 両方 0 / 空なら計算しない。
+	PresignLocalItems int
+	PresignWorkers    []string
 }
 
 func ConfigFromEnv() *Config {
@@ -33,6 +39,17 @@ func ConfigFromEnv() *Config {
 	if n, err := strconv.Atoi(os.Getenv("ISUREAL_DB_MAX_CONNS")); err == nil && n > 0 {
 		maxConns = n
 	}
+	// isu1 は署名1件 約0.45ms で、2万件なら約5秒。残りは SHA 命令のある isu2/isu3（約0.14ms）に任せる。
+	presignLocal := 0
+	if n, err := strconv.Atoi(os.Getenv("ISUREAL_PRESIGN_LOCAL")); err == nil && n >= 0 {
+		presignLocal = n
+	}
+	var presignWorkers []string
+	for _, host := range strings.Split(os.Getenv("ISUREAL_PRESIGN_WORKERS"), ",") {
+		if host = strings.TrimSpace(host); host != "" {
+			presignWorkers = append(presignWorkers, host)
+		}
+	}
 	return &Config{
 		Region:     region,
 		DBHost:     envOrDefault("ISUREAL_DB_HOST", "127.0.0.1"),
@@ -42,6 +59,9 @@ func ConfigFromEnv() *Config {
 		DBName:     envOrDefault("ISUREAL_DB_NAME", "isureal"),
 		LogLevel:   envOrDefault("ISUREAL_LOG_LEVEL", "debug"),
 		DBMaxConns: maxConns,
+
+		PresignLocalItems: presignLocal,
+		PresignWorkers:    presignWorkers,
 	}
 }
 
