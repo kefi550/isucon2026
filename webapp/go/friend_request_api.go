@@ -15,9 +15,9 @@ type createFriendRequestRequest struct {
 }
 
 type createFriendRequestResponse struct {
-	RelationID string    `json:"relationId"`
-	Status     string    `json:"status"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	RelationID string    `json:"relationId" db:"relation_id"`
+	Status     string    `json:"status" db:"status"`
+	UpdatedAt  time.Time `json:"updatedAt" db:"updated_at"`
 }
 
 func createFriendRequestHandler(h *HandlerContext) echo.HandlerFunc {
@@ -33,59 +33,53 @@ func createFriendRequestHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		blocked, err := isBlocked(ctx, tx, actor, input.RecipientID)
-		if err != nil {
+		// ブロック・友達関係・保留中の申請の確認を1往復で行う（判定の順番は従来どおり）
+		var state struct {
+			Blocked            bool    `db:"blocked"`
+			Friends            bool    `db:"friends"`
+			PendingID          *string `db:"pending_id"`
+			PendingRequesterID *string `db:"pending_requester_id"`
+		}
+		if err := tx.GetContext(ctx, &state, `
+   SELECT
+     EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1)) AS blocked,
+     EXISTS(SELECT 1 FROM friendships WHERE user_low_id=$3 AND user_high_id=$4) AS friends,
+     pending.id AS pending_id, pending.requester_id AS pending_requester_id
+   FROM (SELECT 1) one
+   LEFT JOIN LATERAL (
+     SELECT id, requester_id FROM friend_requests WHERE status='pending' AND
+      ((requester_id=$1 AND recipient_id=$2) OR (requester_id=$2 AND recipient_id=$1))
+     LIMIT 1
+   ) pending ON true
+  `, actor, input.RecipientID, min(actor, input.RecipientID), max(actor, input.RecipientID)); err != nil {
 			return err
 		}
-		if blocked {
+		if state.Blocked || state.Friends {
 			return NewAPIError(http.StatusConflict, "relationship_conflict")
 		}
-		friends, err := getFriendIDs(ctx, tx, actor)
-		if err != nil {
-			return err
-		}
-		for _, id := range friends {
-			if id == input.RecipientID {
+		var response createFriendRequestResponse
+		if state.PendingID != nil {
+			if *state.PendingRequesterID == actor {
 				return NewAPIError(http.StatusConflict, "relationship_conflict")
 			}
-		}
-		var existingID string
-		err = tx.GetContext(ctx, &existingID, `
-   SELECT id FROM friend_requests WHERE status='pending' AND
-    ((requester_id=$1 AND recipient_id=$2) OR (requester_id=$2 AND recipient_id=$1))
-  `, actor, input.RecipientID)
-		var requestID string
-		if err == nil {
-			request, err := getFriendRequest(ctx, tx, existingID)
+			// 相手からの保留中の申請があれば、それを承認して友達になる
+			response, err = updateFriendRequestStatus(ctx, tx, *state.PendingID, "accepted", true, actor, input.RecipientID)
 			if err != nil {
 				return err
 			}
-			if request.RequesterID == actor {
-				return NewAPIError(http.StatusConflict, "relationship_conflict")
-			}
-			if _, err := tx.ExecContext(ctx, `UPDATE friend_requests SET status='accepted', updated_at=clock_timestamp() WHERE id=$1`, request.ID); err != nil {
-				return err
-			}
-			if err := insertFriendship(ctx, tx, request); err != nil {
-				return err
-			}
-			requestID = request.ID
-		} else if errors.Is(err, sql.ErrNoRows) {
-			requestID = uuid.NewString()
-			if _, err := tx.ExecContext(ctx, `INSERT INTO friend_requests (id, requester_id, recipient_id, status, created_at, updated_at) VALUES ($1,$2,$3,'pending',clock_timestamp(),clock_timestamp())`, requestID, actor, input.RecipientID); err != nil {
-				return err
-			}
 		} else {
-			return err
-		}
-		request, err := getFriendRequest(ctx, tx, requestID)
-		if err != nil {
-			return err
+			if err := tx.GetContext(ctx, &response, `
+    INSERT INTO friend_requests (id, requester_id, recipient_id, status, created_at, updated_at)
+    VALUES ($1,$2,$3,'pending',clock_timestamp(),clock_timestamp())
+    RETURNING id AS relation_id, status, updated_at
+   `, uuid.NewString(), actor, input.RecipientID); err != nil {
+				return err
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		return c.JSON(http.StatusCreated, createFriendRequestResponse{RelationID: request.ID, Status: request.Status, UpdatedAt: request.UpdatedAt})
+		return c.JSON(http.StatusCreated, response)
 	}
 }
 
@@ -130,35 +124,33 @@ func transitionFriendRequestHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		request, err = getFriendRequest(ctx, tx, input.RequestID)
-		if err != nil {
+		// ロック後の最新状態と、承認時に必要なブロック確認を1往復で取得する
+		var current struct {
+			FriendRequest
+			Blocked bool `db:"blocked"`
+		}
+		if err := tx.GetContext(ctx, &current, `
+   SELECT fr.id, fr.requester_id, fr.recipient_id, fr.status, fr.created_at, fr.updated_at,
+     EXISTS(SELECT 1 FROM block_relations b
+            WHERE (b.blocker_id=fr.requester_id AND b.blocked_id=fr.recipient_id)
+               OR (b.blocker_id=fr.recipient_id AND b.blocked_id=fr.requester_id)) AS blocked
+   FROM friend_requests fr WHERE fr.id=$1
+  `, input.RequestID); err != nil {
 			return err
 		}
-		if request.Status != "pending" {
+		if current.Status != "pending" {
 			return NewAPIError(http.StatusForbidden, "relationship_action_forbidden")
 		}
-		if status == "accepted" {
-			blocked, err := isBlocked(ctx, tx, request.RequesterID, request.RecipientID)
-			if err != nil {
-				return err
-			}
-			if blocked {
-				return NewAPIError(http.StatusConflict, "relationship_conflict")
-			}
-			if err := insertFriendship(ctx, tx, request); err != nil {
-				return err
-			}
+		if status == "accepted" && current.Blocked {
+			return NewAPIError(http.StatusConflict, "relationship_conflict")
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE friend_requests SET status=$2, updated_at=clock_timestamp() WHERE id=$1`, request.ID, status); err != nil {
-			return err
-		}
-		request, err = getFriendRequest(ctx, tx, request.ID)
+		response, err := updateFriendRequestStatus(ctx, tx, current.ID, status, status == "accepted", current.RequesterID, current.RecipientID)
 		if err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		return c.JSON(http.StatusOK, transitionFriendRequestResponse{RelationID: request.ID, Status: request.Status, UpdatedAt: request.UpdatedAt})
+		return c.JSON(http.StatusOK, transitionFriendRequestResponse(response))
 	}
 }

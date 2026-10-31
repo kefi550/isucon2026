@@ -3,7 +3,6 @@ package isureal
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"net/http"
 	"time"
 
@@ -34,15 +33,18 @@ func beginRelationshipTx(ctx context.Context, db *sqlx.DB, actor, target string)
 	if err != nil {
 		return nil, err
 	}
-	for _, id := range []string{min(actor, target), max(actor, target)} {
-		var lockedID string
-		if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 AND status='active' FOR NO KEY UPDATE`, id); err != nil {
-			tx.Rollback()
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, NewAPIError(http.StatusNotFound, "relationship_not_found")
-			}
-			return nil, err
-		}
+	// 2人分のロックを1往復で取る。ORDER BY で並べた順に行がロックされるので、
+	// 従来どおり id の昇順でロックすることになり、デッドロックを避ける性質は変わらない。
+	// COLLATE "C" はバイト順の比較で、Go の min/max（他の処理のロック順）と一致させるために必要。
+	var lockedIDs []string
+	if err := tx.SelectContext(ctx, &lockedIDs, `SELECT id FROM users WHERE id = ANY($1::text[]) AND status='active' ORDER BY id COLLATE "C" FOR NO KEY UPDATE`, []string{actor, target}); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	if len(lockedIDs) != 2 {
+		// どちらかが存在しないか退会済み
+		tx.Rollback()
+		return nil, NewAPIError(http.StatusNotFound, "relationship_not_found")
 	}
 	return tx, nil
 }
@@ -53,9 +55,21 @@ func isBlocked(ctx context.Context, db sqlx.QueryerContext, actor, target string
 	return blocked, err
 }
 
-func insertFriendship(ctx context.Context, tx *sqlx.Tx, request FriendRequest) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id) VALUES ($1,$2,$3,$4)`, uuid.NewString(), min(request.RequesterID, request.RecipientID), max(request.RequesterID, request.RecipientID), request.ID)
-	return err
+// updateFriendRequestStatus は友達申請の状態を更新し、makeFriends のときは同じ1往復で友達関係も作る。
+// userA / userB は申請の2人（順不同）。友達関係の low / high は Go のバイト順比較で決める（従来と同じ）。
+func updateFriendRequestStatus(ctx context.Context, tx *sqlx.Tx, requestID, status string, makeFriends bool, userA, userB string) (createFriendRequestResponse, error) {
+	var response createFriendRequestResponse
+	err := tx.GetContext(ctx, &response, `
+  WITH updated AS (
+    UPDATE friend_requests SET status=$2::text, updated_at=clock_timestamp() WHERE id=$1::text
+    RETURNING id, status, updated_at
+  ), friendship AS (
+    INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id)
+    SELECT $4::text, $5::text, $6::text, $1::text WHERE $3::boolean
+  )
+  SELECT id AS relation_id, status, updated_at FROM updated
+ `, requestID, status, makeFriends, uuid.NewString(), min(userA, userB), max(userA, userB))
+	return response, err
 }
 
 func requireRelationshipChange(result sql.Result, err error, status int, code string) error {
