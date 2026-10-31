@@ -153,14 +153,21 @@ func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		var postID string
-		err := h.DB.GetContext(ctx, &postID, `
-   SELECT p.id FROM posts p
+		// 「今日の投稿の ID」「投稿」「ユーザー」を1往復で取る（従来は3往復）。
+		// 投稿の条件は従来の1本目のクエリと同じ。ユーザーは status を見ずに結合し、有効でなければ従来の getUser と同じく ErrNoRows（500）にする。
+		var row struct {
+			PostWithAuthor
+			AuthorStatus string `db:"author_status"`
+		}
+		err := h.DB.GetContext(ctx, &row, `
+   SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`, u.status AS author_status
+   FROM posts p
    JOIN posting_windows w ON w.id = p.posting_window_id
    JOIN users u ON u.id = p.author_id
    JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
                               AND current.local_date = w.local_date
    WHERE p.author_id = $1 AND p.deleted_at IS NULL
+   LIMIT 1
   `, userID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
@@ -168,18 +175,14 @@ func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		post, err := getPost(ctx, h.DB, postID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "post_not_found")
+		if row.AuthorStatus != "active" {
+			return sql.ErrNoRows
 		}
-		if err != nil {
+		user := row.Author
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
-		user, err := getUser(ctx, h.DB, userID)
-		if err != nil {
-			return err
-		}
-		return c.JSON(http.StatusOK, getMyCurrentPostResponse(newPostResponse(post, user)))
+		return c.JSON(http.StatusOK, getMyCurrentPostResponse(newPostResponse(row.Post, user)))
 	}
 }
 

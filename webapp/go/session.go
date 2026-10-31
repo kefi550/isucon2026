@@ -79,29 +79,25 @@ func SessionMiddleware(handlerContext *HandlerContext, authRequired bool) echo.M
 }
 
 func InvalidateLoginSession(db *sqlx.DB, userID string, tokenHash string) error {
-	tx, err := db.Beginx()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	var lockedUserID string
-	if err := tx.Get(&lockedUserID, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID); err != nil {
-		return fmt.Errorf("failed to lock user: %w", err)
-	}
-
-	if _, err := tx.Exec(`
-		UPDATE login_sessions
-		SET active = false, invalidated_at = clock_timestamp(), reason = 'logout'
-		WHERE user_id = $1 AND active = true AND token_hash = $2	
+	// ユーザー行のロックとセッションの無効化を1つの文（=1つのトランザクション、1往復）で行う。
+	// ログインと同じユーザー行をロックするので、ログインとの順序づけは従来どおり保たれる。
+	// ユーザーが存在しないときは、従来と同じくエラーにする（ロックできた行数で判定する）。
+	var locked int
+	if err := db.Get(&locked, `
+		WITH locked AS (
+			SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE
+		), invalidated AS (
+			UPDATE login_sessions
+			SET active = false, invalidated_at = clock_timestamp(), reason = 'logout'
+			WHERE user_id = (SELECT id FROM locked) AND active = true AND token_hash = $2
+		)
+		SELECT count(*) FROM locked
 	`, userID, tokenHash); err != nil {
 		return fmt.Errorf("failed to invalidate sessions: %w", err)
 	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+	if locked == 0 {
+		return fmt.Errorf("failed to lock user: %w", sql.ErrNoRows)
 	}
-
 	return nil
 }
 
