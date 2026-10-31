@@ -71,6 +71,37 @@ func TestSignedImageURLReusesSignature(t *testing.T) {
 	}
 }
 
+func TestSignedImageURLReuseWindow(t *testing.T) {
+	clearImageSignatureCache()
+	key := bytesRepeat(0xcd)
+	user := User{ImageKey: key}
+	imageID := "22222222-2222-2222-2222-222222222222"
+	base := time.Date(2026, 10, 31, 10, 0, 0, 0, time.UTC)
+
+	first := signedImageURLAt(user, imageID, base)
+	if got := signedImageURLAt(user, imageID, base.Add((imageURLReuseSeconds-1)*time.Second)); got != first {
+		t.Fatalf("expected reuse within the window\n%s\n%s", first, got)
+	}
+	refreshed := signedImageURLAt(user, imageID, base.Add(imageURLReuseSeconds*time.Second))
+	if refreshed == first {
+		t.Fatal("expected a new URL after the window")
+	}
+	exp, sig := parseSignedImageURL(t, refreshed, imageID)
+	if want := base.Add(imageURLReuseSeconds*time.Second + imageURLLifetime).Unix(); exp != want {
+		t.Fatalf("exp = %d, want %d", exp, want)
+	}
+	if !hmac.Equal(sig, computeImageSignature(key, imageID, exp)) {
+		t.Fatal("refreshed signature does not match HMAC")
+	}
+	firstExp, firstSig := parseSignedImageURL(t, first, imageID)
+	if !hmac.Equal(imageSignature(key, imageID, firstExp), firstSig) {
+		t.Fatal("an earlier URL must still verify")
+	}
+	if other := signedImageURLAt(User{ImageKey: bytesRepeat(0xce)}, imageID, base); other == first {
+		t.Fatal("a different key must not reuse the URL")
+	}
+}
+
 func TestSignedImageURLConcurrent(t *testing.T) {
 	clearImageSignatureCache()
 	user := User{ImageKey: bytesRepeat(0x11)}

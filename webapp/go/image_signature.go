@@ -17,6 +17,10 @@ import (
 const imageURLLifetime = 24 * time.Hour
 const imageSignatureIterations = 1000
 
+// 同じ鍵と画像の URL は、発行からこの秒数のあいだ使い回す。exp は now+24h より最大でこの秒数だけ前になる。
+// 先（切り上げ）にずらすと、1時間単位でベンチに範囲外とされた。
+const imageURLReuseSeconds = 60
+
 func imageSigningKey(secretKeyHash string) ([]byte, error) {
 	key, err := hex.DecodeString(secretKeyHash)
 	if err != nil || len(key) != sha256.Size {
@@ -51,13 +55,20 @@ type imageSignatureCacheKey struct {
 }
 
 type imageSignatureCacheEntry struct {
+	exp int64
 	sig []byte
 	url string
+}
+
+type issuedImageURLKey struct {
+	key     [sha256.Size]byte
+	imageID string
 }
 
 var (
 	imageSignatureCacheMu sync.RWMutex
 	imageSignatureCache   = map[imageSignatureCacheKey]imageSignatureCacheEntry{}
+	issuedImageURLs       = map[issuedImageURLKey]imageSignatureCacheEntry{}
 	imageSignatureFlight  singleflight.Group
 )
 
@@ -84,12 +95,25 @@ func loadImageSignature(key imageSignatureCacheKey) (imageSignatureCacheEntry, b
 func storeImageSignature(key imageSignatureCacheKey, entry imageSignatureCacheEntry) {
 	imageSignatureCacheMu.Lock()
 	imageSignatureCache[key] = entry
+	issuedImageURLs[issuedImageURLKey{key: key.key, imageID: key.imageID}] = entry
 	imageSignatureCacheMu.Unlock()
+}
+
+// exp の時点で使い回せる発行済みの URL を返す。
+func loadIssuedImageURL(key imageSignatureCacheKey) (string, bool) {
+	imageSignatureCacheMu.RLock()
+	entry, ok := issuedImageURLs[issuedImageURLKey{key: key.key, imageID: key.imageID}]
+	imageSignatureCacheMu.RUnlock()
+	if !ok || entry.exp > key.exp || key.exp-entry.exp >= imageURLReuseSeconds {
+		return "", false
+	}
+	return entry.url, true
 }
 
 func clearImageSignatureCache() {
 	imageSignatureCacheMu.Lock()
 	imageSignatureCache = map[imageSignatureCacheKey]imageSignatureCacheEntry{}
+	issuedImageURLs = map[issuedImageURLKey]imageSignatureCacheEntry{}
 	imageSignatureCacheMu.Unlock()
 }
 
@@ -112,20 +136,24 @@ func formatSignedImageURL(imageID string, exp int64, sig []byte) string {
 }
 
 func signedImageURL(user User, imageID string) string {
-	exp := imageSignatureExpiry(time.Now())
+	return signedImageURLAt(user, imageID, time.Now())
+}
+
+func signedImageURLAt(user User, imageID string, now time.Time) string {
+	exp := imageSignatureExpiry(now)
 	cacheKey, ok := newImageSignatureCacheKey(user.ImageKey, imageID, exp)
 	if !ok {
 		return formatSignedImageURL(imageID, exp, computeImageSignature(user.ImageKey, imageID, exp))
 	}
-	if entry, ok := loadImageSignature(cacheKey); ok {
-		return entry.url
+	if url, ok := loadIssuedImageURL(cacheKey); ok {
+		return url
 	}
 	value, _, _ := imageSignatureFlight.Do(cacheKey.flightKey(), func() (any, error) {
-		if entry, ok := loadImageSignature(cacheKey); ok {
-			return entry.url, nil
+		if url, ok := loadIssuedImageURL(cacheKey); ok {
+			return url, nil
 		}
 		sig := computeImageSignature(user.ImageKey, imageID, exp)
-		entry := imageSignatureCacheEntry{sig: sig, url: formatSignedImageURL(imageID, exp, sig)}
+		entry := imageSignatureCacheEntry{exp: exp, sig: sig, url: formatSignedImageURL(imageID, exp, sig)}
 		storeImageSignature(cacheKey, entry)
 		return entry.url, nil
 	})
