@@ -69,3 +69,35 @@ BEGIN
   WHERE p.id = p_post_id;
 END
 $$;
+
+-- ログインを1往復で行う。資格情報が違う、または退会済みなら何も書かずに0行を返す（呼び出し側は 401）。
+-- 処理の順序とロックは Go で1文ずつ発行していたときと同じ。
+CREATE OR REPLACE FUNCTION isureal_login(
+  p_username text, p_secret_key_hash text, p_session_id text, p_token_hash text
+) RETURNS TABLE (
+  id text, username text, display_name text, bio text, region text, account_type text, status text
+) LANGUAGE plpgsql AS $$
+#variable_conflict use_column
+DECLARE
+  v_user users%ROWTYPE;
+BEGIN
+  SELECT * INTO v_user FROM users u WHERE u.username = p_username;
+  IF NOT FOUND OR v_user.status <> 'active' OR v_user.secret_key_hash <> p_secret_key_hash THEN
+    RETURN;
+  END IF;
+
+  PERFORM 1 FROM users u WHERE u.id = v_user.id AND u.status = 'active' FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  UPDATE login_sessions s
+  SET active = false, invalidated_at = clock_timestamp(), reason = 'replaced'
+  WHERE s.user_id = v_user.id AND s.active = true;
+
+  INSERT INTO login_sessions (id, user_id, token_hash) VALUES (p_session_id, v_user.id, p_token_hash);
+
+  RETURN QUERY SELECT v_user.id::text, v_user.username::text, v_user.display_name, v_user.bio,
+                      v_user.region, v_user.account_type, v_user.status;
+END
+$$;

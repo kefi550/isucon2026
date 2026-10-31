@@ -118,35 +118,22 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
 		if !usernamePattern.MatchString(input.Username) {
 			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
 		}
-		ctx := c.Request().Context()
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		var user User
-		err = tx.GetContext(ctx, &user, `SELECT id, username, secret_key_hash, display_name, bio, profile_image_id, region, account_type, status FROM users WHERE username = $1`, input.Username)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
-		}
-		if err != nil {
-			return err
-		}
 		hash := sha256.Sum256([]byte(input.SecretKey))
-		if user.Status != "active" || user.SecretKeyHash != hex.EncodeToString(hash[:]) {
-			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
-		}
-		session, err := createLoginSessionTx(ctx, tx, user.ID)
+		token := uuid.NewString()
+		tokenHash := sha256.Sum256([]byte(token))
+		// 資格情報の確認からセッションの差し替えまでを、DB 関数の1往復で行う（004-functions.sql）
+		var user User
+		err := h.DB.GetContext(c.Request().Context(), &user, `
+   SELECT id, username, display_name, bio, region, account_type, status
+   FROM isureal_login($1, $2, $3, $4)
+  `, input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hex.EncodeToString(tokenHash[:]))
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
 		}
 		if err != nil {
 			return err
 		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-		return c.JSON(http.StatusOK, loginResponse{Token: session.Token, User: newSessionUserResponse(user)})
+		return c.JSON(http.StatusOK, loginResponse{Token: token, User: newSessionUserResponse(user)})
 	}
 }
 
