@@ -3,6 +3,7 @@ package isureal
 import (
 	"database/sql"
 	"expvar"
+	"log/slog"
 	"os"
 	"sync"
 
@@ -32,6 +33,9 @@ func NewServer(config *Config) *echo.Echo {
 	}
 	e := echo.New()
 	e.IPExtractor = extractClientIP
+	// ログは出さない。isureal-guard が BAN に使うアクションログだけは ActionLogMiddleware が出す（action_log.go）。
+	slog.SetDefault(slog.New(slog.DiscardHandler))
+	e.Logger = slog.New(slog.DiscardHandler)
 
 	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout))
 	e.Use(middleware.Recover())

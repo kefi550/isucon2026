@@ -54,6 +54,20 @@ var actionNames = map[string]string{
 	"POST /api/admin/posting-window":                "open_posting_window",
 }
 
+// guardWatches は、isureal-guard（/opt/isureal-guard）が journal から読んで BAN に使う行か。
+// guard が数えるのはこの3種類だけなので、ほかのリクエストのログは出さない。
+func guardWatches(action string, status int, abuse string) bool {
+	switch action {
+	case "login":
+		return status == http.StatusUnauthorized
+	case "put_profile_image":
+		return status == http.StatusBadRequest && abuse == "invalid_image"
+	case "get_image":
+		return status == http.StatusForbidden && abuse == "invalid_signature"
+	}
+	return false
+}
+
 var logLevelRanks = map[string]int{"debug": 0, "info": 1, "error": 2}
 
 func ActionLogMiddleware(minLevel string, output io.Writer) echo.MiddlewareFunc {
@@ -77,6 +91,11 @@ func ActionLogMiddleware(minLevel string, output io.Writer) echo.MiddlewareFunc 
 			}
 
 			route := c.RouteInfo()
+			action, ok := actionNames[route.Method+" "+route.Path]
+			abuse, _ := c.Get("abuse").(string)
+			if !guardWatches(action, status, abuse) {
+				return nil
+			}
 			entry := map[string]any{
 				"level":   level,
 				"action":  nil,
@@ -84,7 +103,6 @@ func ActionLogMiddleware(minLevel string, output io.Writer) echo.MiddlewareFunc 
 				"ip":      c.RealIP(),
 				"user_id": nil,
 			}
-			action, ok := actionNames[route.Method+" "+route.Path]
 			if ok {
 				entry["action"] = action
 			}
@@ -97,7 +115,6 @@ func ActionLogMiddleware(minLevel string, output io.Writer) echo.MiddlewareFunc 
 					entry["username"] = username
 				}
 			}
-			abuse, _ := c.Get("abuse").(string)
 			if abuse != "" {
 				entry["abuse"] = abuse
 			}

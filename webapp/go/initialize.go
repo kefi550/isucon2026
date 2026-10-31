@@ -3,7 +3,6 @@ package isureal
 import (
 	"log/slog"
 	"net/http"
-	"os"
 	"os/exec"
 
 	"github.com/labstack/echo/v5"
@@ -22,8 +21,6 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		clearImageSignatureCache()
 		clearImageCreatedAtCache()
 		cmd := exec.Command("../sql/init.sh")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return err
 		}
