@@ -177,6 +177,7 @@ CREATE INDEX posts_author_id ON posts(author_id);
 CREATE INDEX posts_posting_window_id ON posts(posting_window_id);
 CREATE INDEX posts_image_id ON posts (image_id);
 CREATE INDEX posts_posted_at_id ON posts (posted_at, id);
+CREATE INDEX posts_author_posted_at_active ON posts (author_id, posted_at DESC, id DESC) INCLUDE (posting_window_id) WHERE deleted_at IS NULL;
 
 CREATE TABLE friend_requests (
   id varchar(36) PRIMARY KEY,

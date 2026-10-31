@@ -16,6 +16,9 @@ CREATE INDEX IF NOT EXISTS friend_requests_requester_id_status ON friend_request
 CREATE INDEX IF NOT EXISTS friend_requests_recipient_id_status ON friend_requests (recipient_id, status);
 CREATE INDEX IF NOT EXISTS posts_image_id ON posts (image_id);
 CREATE INDEX IF NOT EXISTS posts_posted_at_id ON posts (posted_at, id);
+-- Memories などの「ある作者の投稿を新しい順に」を、テーブル本体を読まずに索引だけで求める（index-only scan）。
+-- posts_author_id だけだと、作者の全投稿をテーブルから1件ずつ読んでから月で絞ることになり、ディスクの読み取りが多かった。
+CREATE INDEX IF NOT EXISTS posts_author_posted_at_active ON posts (author_id, posted_at DESC, id DESC) INCLUDE (posting_window_id) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS realmojis_image_id ON realmojis (image_id);
 CREATE INDEX IF NOT EXISTS comments_post_id_created_at_id ON comments (post_id, created_at, id);
 -- notifications は、窓の開始で全ユーザー分（約1700行）を一括 INSERT する。行ごとに更新する構造を最小にする:
