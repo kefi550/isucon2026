@@ -38,7 +38,8 @@ func NewServer(config *Config) *echo.Echo {
 		panic("failed to open database: " + err.Error())
 	}
 	// 合計は DB の max_connections（database/.../conf.d/92-connections.conf の300）に収めること。
-	// 通常の上限は config.DBMaxConns（asia 24、europe と america 75）。画像用の15本を足して、3台で 39 + 90 + 90 = 219 本。
+	// 通常の上限は config.DBMaxConns（asia 24、europe と america 30）。画像用の5本を足して、3台で 29 + 35 + 35 = 99 本。
+	// 本数は DB のメモリでも決まる。待機中の接続も1本ごとにメモリを持ち、約190本でメモリが尽きた。
 	// アイドルの上限を同じにしないと、既定の2本を超えた接続が毎回張り直され、遠いリージョンで数往復を失う。
 	db.SetMaxOpenConns(config.DBMaxConns)
 	db.SetMaxIdleConns(config.DBMaxConns)
@@ -52,8 +53,8 @@ func NewServer(config *Config) *echo.Echo {
 	if err != nil {
 		panic("failed to open image database: " + err.Error())
 	}
-	imageDB.SetMaxOpenConns(15)
-	imageDB.SetMaxIdleConns(15)
+	imageDB.SetMaxOpenConns(5)
+	imageDB.SetMaxIdleConns(5)
 	if err := imageDB.Ping(); err != nil {
 		panic("failed to ping image database: " + err.Error())
 	}
