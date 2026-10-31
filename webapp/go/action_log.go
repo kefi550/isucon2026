@@ -37,6 +37,7 @@ var actionNames = map[string]string{
 	"GET /api/posts/:postId/realmojis":              "get_real_mojis",
 	"DELETE /api/realmojis/:realMojiId":             "delete_real_moji",
 	"GET /api/images/:imageId":                      "get_image",
+	"GET /_internal/image-data/:imageId":            "get_image_data",
 	"GET /api/notifications":                        "get_notifications",
 	"POST /api/friend-requests":                     "create_friend_request",
 	"POST /api/friend-requests/:requestId/:action":  "transition_friend_request",
