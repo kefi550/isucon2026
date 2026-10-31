@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
 
 	"github.com/labstack/echo/v5"
 )
@@ -13,6 +16,27 @@ import (
 type exportPostResponse struct {
 	createPostResponse
 	ImagePath string `json:"imagePath"`
+}
+
+// 初期データの画像は、isu1 の画像置き場（ローカルのファイル）にある（image_api.go）。
+// エクスポートは1回に百枚以上読むので、DB（TOAST）からではなくそこから並列に読む。読めなかった画像は DB から読む。
+var exportImageDir = envOrDefault("ISUREAL_IMAGE_DIR", "/var/lib/isureal-images")
+
+const exportImageFetchConcurrency = 16
+
+// imageStoreAvailable は、このサーバーに画像置き場があるか（isu1 だけにある。isu2 / isu3 は DB から返す）。
+// 起動時に1度だけ確認する。
+var imageStoreAvailable = func() bool {
+	st, err := os.Stat(exportImageDir)
+	return err == nil && st.IsDir()
+}()
+
+func fetchStoredImage(imageID string) ([]byte, bool) {
+	if !imageIDPattern.MatchString(imageID) {
+		return nil, false
+	}
+	data, err := os.ReadFile(filepath.Join(exportImageDir, imageID[:2], imageID))
+	return data, err == nil
 }
 
 func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
@@ -26,9 +50,12 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 		var posts []struct {
 			Post
 			ImageData []byte `db:"image_data"`
+			Initial   bool   `db:"initial"`
 		}
 		if err := h.DB.SelectContext(ctx, &posts, `
-   SELECT `+postColumns+`, i.data AS image_data
+   SELECT `+postColumns+`,
+     CASE WHEN $2::boolean AND i.created_at <= (SELECT b.created_at FROM initial_data_boundary b) THEN NULL ELSE i.data END AS image_data,
+     ($2::boolean AND i.created_at <= (SELECT b.created_at FROM initial_data_boundary b)) AS initial
    FROM posts p
    JOIN posting_windows w ON w.id = p.posting_window_id
    -- 投稿画像の created_at は投稿の posted_at と同じ値（投稿作成時に同じ時刻を入れている。初期データも全件一致を確認済み）。
@@ -36,8 +63,34 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
    JOIN image_objects i ON i.id = p.image_id AND i.created_at = p.posted_at
    WHERE p.author_id = $1 AND p.deleted_at IS NULL
    ORDER BY p.posted_at, p.id
-  `, userID); err != nil {
+  `, userID, imageStoreAvailable); err != nil {
 			return err
+		}
+
+		// 初期データの画像を画像置き場から並列に取る。取れなかったものは DB から読む。
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, exportImageFetchConcurrency)
+		for i := range posts {
+			if !posts[i].Initial {
+				continue
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if data, ok := fetchStoredImage(posts[i].ImageID); ok {
+					posts[i].ImageData = data
+				}
+			}(i)
+		}
+		wg.Wait()
+		for i := range posts {
+			if posts[i].Initial && posts[i].ImageData == nil {
+				if err := h.DB.GetContext(ctx, &posts[i].ImageData, `SELECT data FROM image_objects WHERE id = $1 AND created_at = $2`, posts[i].ImageID, posts[i].PostedAt); err != nil {
+					return err
+				}
+			}
 		}
 
 		var body bytes.Buffer

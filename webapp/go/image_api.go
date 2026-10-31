@@ -118,7 +118,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		// 画像置き場に任せてよい経路か（nginx 経由で、ID が X-Accel-Redirect のパスに使える形式）
-		forStore := c.Request().Header.Get(imageStoreHeader) == "1" && imageIDPattern.MatchString(input.ImageID)
+		forStore := imageStoreAvailable && c.Request().Header.Get(imageStoreHeader) == "1" && imageIDPattern.MatchString(input.ImageID)
 		lookup := imageLookupQuery
 		if forStore {
 			lookup = imageLookupQueryForStore

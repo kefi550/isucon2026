@@ -27,7 +27,6 @@ for i in $targets; do
   echo "== ${host} (${mode})"
   if [ "$mode" = deploy ]; then
     rsync -a nginx/isureal.conf "${host}:/tmp/isureal.conf.new"
-    rsync -a nginx/isureal-image-store.conf "${host}:/tmp/isureal-image-store.conf.new"
   else
     rsync -a nginx/original/isureal.conf "${host}:/tmp/isureal.conf.new"
   fi
@@ -45,11 +44,8 @@ restore() {
   if [ -f /tmp/isureal-image-store.conf.bak ]; then sudo cp -p /tmp/isureal-image-store.conf.bak "$store"; else sudo rm -f "$store"; fi
 }
 
-if [ "$MODE" = deploy ]; then
-  sudo install -m 644 /tmp/isureal-image-store.conf.new "$store"
-else
-  sudo rm -f "$store"
-fi
+# 画像は全サーバーのローカルのファイルから返すので、画像置き場の upstream の設定は置かない
+sudo rm -f "$store"
 sudo install -m 644 /tmp/isureal.conf.new "$site"
 
 if sudo nginx -t; then
