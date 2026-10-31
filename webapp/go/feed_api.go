@@ -55,25 +55,15 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		following := map[string]bool{}
-		if input.Feed == "following" {
-			var followeeIDs []string
-			if err := h.DB.SelectContext(ctx, &followeeIDs, `SELECT followee_id FROM follows WHERE follower_id = $1`, viewer.ID); err != nil {
-				return err
-			}
-			for _, id := range followeeIDs {
-				following[id] = true
-			}
+		// 今日まだ投稿していない閲覧者は、自分以外の投稿を一切見られない（canView 参照）
+		if !viewer.HasPostedToday {
+			return c.JSON(http.StatusOK, getFeedResponse{Items: []feedItemResponse{}})
 		}
 		beforePostedAt, beforeID := input.BeforePostedAt, input.BeforeID
 		if ranked {
 			beforePostedAt, beforeID = nil, ""
 		}
-		posts, err := selectPostsWithAuthor(ctx, h.DB, `
-   AND p.author_id <> $1 AND w.ended_at IS NULL
-   AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))
-   ORDER BY p.posted_at DESC, p.id DESC
-  `, viewer.ID, beforePostedAt, beforeID)
+		posts, following, err := selectFeedCandidates(ctx, h.DB, viewer, input.Feed, beforePostedAt, beforeID)
 		if err != nil {
 			return err
 		}
@@ -113,6 +103,68 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		return c.JSON(http.StatusOK, getFeedResponse{Items: items, HasMore: hasMore})
 	}
+}
+
+// selectFeedCandidates は canView と matchesFeed の条件を SQL に展開して、フィード候補の投稿を取得する。
+// 条件は canView / matchesFeed と完全に一致させること（広いと LIMIT 後に件数が欠け、狭いと投稿が漏れる）。
+// 呼び出し側でも canView / matchesFeed で再確認し、権限のない投稿を返さないようにしている。
+// following フィードでは、取得した投稿の作者（=フォロー中のユーザー）を following として返す。
+func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewer viewerContext, feed string, beforePostedAt *time.Time, beforeID string) ([]PostWithAuthor, map[string]bool, error) {
+	friends := userIDList(viewer.Friends, nil)
+	args := []any{viewer.ID, beforePostedAt, beforeID, userIDList(viewer.Blocked, nil)}
+	var condition string
+	switch feed {
+	case "public":
+		condition = `AND p.visibility = 'public'`
+	case "friends":
+		args = append(args, friends)
+		condition = `AND p.author_id = ANY($5::text[]) AND p.visibility IN ('public', 'friends', 'friends_of_friends')`
+	case "following":
+		args = append(args, friends, userIDList(viewer.FriendsOfFriends, nil))
+		condition = `AND p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)
+   AND (p.visibility = 'public'
+     OR (p.visibility IN ('friends', 'friends_of_friends') AND p.author_id = ANY($5::text[]))
+     OR (p.visibility = 'friends_of_friends' AND p.author_id = ANY($6::text[])))`
+	case "friends-of-friends":
+		// 友達の友達のうち、友達本人と閲覧者自身を除いたユーザー
+		args = append(args, userIDList(viewer.FriendsOfFriends, func(id string) bool { return !viewer.Friends[id] && id != viewer.ID }))
+		condition = `AND p.author_id = ANY($5::text[]) AND p.visibility IN ('public', 'friends_of_friends')`
+	default:
+		return nil, nil, nil
+	}
+	limit := ` LIMIT 51`
+	if feed == "friends-of-friends" {
+		// スコア順に並べ替えるため候補を全件取る
+		limit = ``
+	}
+	posts, err := selectPostsWithAuthor(ctx, db, `
+   AND p.author_id <> $1 AND w.ended_at IS NULL
+   AND NOT (p.author_id = ANY($4::text[]))
+   AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))
+   `+condition+`
+   ORDER BY p.posted_at DESC, p.id DESC`+limit, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	following := map[string]bool{}
+	if feed == "following" {
+		for _, post := range posts {
+			following[post.AuthorID] = true
+		}
+	}
+	return posts, following, nil
+}
+
+// userIDList は集合を SQL の配列パラメータ用のスライスに変換する。
+// nil スライスは SQL の NULL になり ANY / NOT ANY の結果が壊れるため、必ず空でない（非 nil の）スライスを返す。
+func userIDList(set map[string]bool, keep func(string) bool) []string {
+	ids := make([]string, 0, len(set))
+	for id, ok := range set {
+		if ok && (keep == nil || keep(id)) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func rankedBefore(score int64, post Post, beforeScore int64, beforePostedAt time.Time, beforeID string) bool {

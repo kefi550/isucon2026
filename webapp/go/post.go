@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -100,46 +101,78 @@ type viewerContext struct {
 	Blocked          map[string]bool
 }
 
+// viewerUserColumns は users を別名 u で参照するときの列リスト（列名は User 構造体のタグと一致させる）
+var viewerUserColumns = func() string {
+	columns := make([]string, len(userColumns))
+	for i, column := range userColumns {
+		columns[i] = "u." + column
+	}
+	return strings.Join(columns, ", ")
+}()
+
 func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID string) (viewerContext, error) {
-	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}}
-	var err error
-	if viewer.User, err = getUser(ctx, db, viewerID); err != nil {
+	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}, Blocked: map[string]bool{}}
+
+	// ユーザー情報と「今日投稿済みか」を1往復で取得する（リージョン間の往復回数を減らすため）
+	var row struct {
+		User
+		HasPostedToday bool `db:"has_posted_today"`
+	}
+	if err := sqlx.GetContext(ctx, db, &row, `
+  SELECT `+viewerUserColumns+`,
+    EXISTS(
+      SELECT 1 FROM posts p
+      JOIN posting_windows posted ON posted.id = p.posting_window_id
+      JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
+                                  AND current.local_date = posted.local_date
+      WHERE p.author_id = u.id AND p.deleted_at IS NULL
+    ) AS has_posted_today
+  FROM users u WHERE u.id = $1 AND u.status = 'active'
+ `, viewerID); err != nil {
 		return viewer, err
 	}
-	if err := sqlx.GetContext(ctx, db, &viewer.HasPostedToday, `
-  SELECT EXISTS(
-    SELECT 1 FROM posts p
-    JOIN posting_windows posted ON posted.id = p.posting_window_id
-    JOIN posting_windows current ON current.region = $2 AND current.ended_at IS NULL
-                                AND current.local_date = posted.local_date
-    WHERE p.author_id = $1 AND p.deleted_at IS NULL
+	viewer.User = row.User
+	viewer.HasPostedToday = row.HasPostedToday
+	if err := viewer.User.setImageKey(); err != nil {
+		return viewer, err
+	}
+
+	// ブロック関係と、友達・友達の友達の算出に必要な友達関係を1往復で取得する。
+	// kind='b' は相手のユーザーID（first_id）、kind='f' は friendships の1行（low, high）を表す。
+	// 友達の友達関係には viewer 自身との関係も必ず含まれるため、そこから友達一覧も復元できる。
+	var relations []struct {
+		Kind     string `db:"kind"`
+		FirstID  string `db:"first_id"`
+		SecondID string `db:"second_id"`
+	}
+	if err := sqlx.SelectContext(ctx, db, &relations, `
+  WITH friend_ids AS (
+    SELECT CASE WHEN user_low_id = $1 THEN user_high_id ELSE user_low_id END AS id
+    FROM friendships WHERE user_low_id = $1 OR user_high_id = $1
   )
- `, viewer.ID, viewer.Region); err != nil {
+  SELECT 'b' AS kind, CASE WHEN blocker_id = $1 THEN blocked_id ELSE blocker_id END AS first_id, '' AS second_id
+  FROM block_relations WHERE blocker_id = $1 OR blocked_id = $1
+  UNION ALL
+  SELECT 'f' AS kind, user_low_id AS first_id, user_high_id AS second_id
+  FROM friendships
+  -- IN (SELECT ...) だと全件走査の計画になるため、配列化してインデックス（low 側の UNIQUE と friendships_user_high_id）を使わせる
+  WHERE user_low_id = ANY(ARRAY(SELECT id FROM friend_ids)) OR user_high_id = ANY(ARRAY(SELECT id FROM friend_ids))
+ `, viewer.ID); err != nil {
 		return viewer, err
 	}
-	if viewer.Blocked, err = getBlockedUserIDs(ctx, db, viewer.ID); err != nil {
-		return viewer, err
-	}
-	friends, err := getFriendIDs(ctx, db, viewer.ID)
-	if err != nil {
-		return viewer, err
-	}
-	if len(friends) == 0 {
-		return viewer, nil
-	}
-	for _, id := range friends {
-		viewer.Friends[id] = true
-	}
-	query, args, err := sqlx.In(`SELECT user_low_id, user_high_id FROM friendships WHERE user_low_id IN (?) OR user_high_id IN (?)`, friends, friends)
-	if err != nil {
-		return viewer, err
-	}
-	var friendships []struct {
-		UserLowID  string `db:"user_low_id"`
-		UserHighID string `db:"user_high_id"`
-	}
-	if err := sqlx.SelectContext(ctx, db, &friendships, sqlx.Rebind(sqlx.DOLLAR, query), args...); err != nil {
-		return viewer, err
+	type friendshipPair struct{ UserLowID, UserHighID string }
+	friendships := make([]friendshipPair, 0, len(relations))
+	for _, relation := range relations {
+		if relation.Kind == "b" {
+			viewer.Blocked[relation.FirstID] = true
+			continue
+		}
+		friendships = append(friendships, friendshipPair{UserLowID: relation.FirstID, UserHighID: relation.SecondID})
+		if relation.FirstID == viewer.ID {
+			viewer.Friends[relation.SecondID] = true
+		} else if relation.SecondID == viewer.ID {
+			viewer.Friends[relation.FirstID] = true
+		}
 	}
 	for _, friendship := range friendships {
 		if viewer.Friends[friendship.UserLowID] {
