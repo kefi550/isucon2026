@@ -31,7 +31,9 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
    SELECT `+postColumns+`, i.data AS image_data
    FROM posts p
    JOIN posting_windows w ON w.id = p.posting_window_id
-   JOIN image_objects i ON i.id = p.image_id
+   -- 投稿画像の created_at は投稿の posted_at と同じ値（投稿作成時に同じ時刻を入れている。初期データも全件一致を確認済み）。
+   -- パーティションキーの created_at を結合条件に入れて、36 個すべてのパーティションを探さないようにする。
+   JOIN image_objects i ON i.id = p.image_id AND i.created_at = p.posted_at
    WHERE p.author_id = $1 AND p.deleted_at IS NULL
    ORDER BY p.posted_at, p.id
   `, userID); err != nil {
