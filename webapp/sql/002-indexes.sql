@@ -2,7 +2,12 @@
 -- 2回目以降の CREATE INDEX IF NOT EXISTS は何もしない。
 
 CREATE INDEX IF NOT EXISTS image_objects_id ON image_objects (id);
-CREATE INDEX IF NOT EXISTS users_username ON users (username);
+-- ユーザー名の一意性は register の LOCK TABLE ではなく UNIQUE で保証する。
+-- 既存の非ユニーク index は UNIQUE の作成に成功してから消す。2回目以降はどちらも何もしない。
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_key ON users (username);
+DROP INDEX IF EXISTS users_username;
+-- 窓の開始が、リージョンの active なユーザーを読むときに使う。
+CREATE INDEX IF NOT EXISTS users_region_active ON users (region) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS login_sessions_token_hash ON login_sessions (token_hash);
 CREATE INDEX IF NOT EXISTS friendships_user_high_id ON friendships (user_high_id);
 CREATE INDEX IF NOT EXISTS follows_followee_id ON follows (followee_id);

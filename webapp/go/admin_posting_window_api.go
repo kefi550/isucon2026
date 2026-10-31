@@ -43,7 +43,8 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		if _, err := tx.ExecContext(ctx, `LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		// 同じリージョンの窓開始だけを直列化する。users の行ロックや UPDATE は止めない。
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('posting_window'), hashtext($1))`, region); err != nil {
 			return err
 		}
 		var conflict bool
@@ -71,6 +72,30 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		if _, err := tx.ExecContext(ctx, `
    INSERT INTO notifications (id, user_id, posting_window_id, created_at)
    SELECT gen_random_uuid()::text, id, $2, $3 FROM users WHERE region = $1 AND status = 'active'
+  `, region, windowID, startsAt); err != nil {
+			return err
+		}
+		// 一括 INSERT のあいだにコミットした登録・退会・リージョン変更を、ここで通知対象へ反映する。
+		// 待たせるのはその3つだけで、一括 INSERT のあいだは待たない。
+		if err := lockUserMembership(ctx, tx); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+   DELETE FROM notifications n
+   USING users u
+   WHERE n.posting_window_id = $2 AND n.user_id = u.id AND (u.region <> $1 OR u.status <> 'active')
+  `, region, windowID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+   INSERT INTO notifications (id, user_id, posting_window_id, created_at)
+   SELECT gen_random_uuid()::text, u.id, $2::text, $3::timestamptz
+   FROM users u
+   WHERE u.region = $1 AND u.status = 'active'
+     AND NOT EXISTS (
+       SELECT 1 FROM notifications n
+       WHERE n.user_id = u.id AND n.posting_window_id = $2::text
+     )
   `, region, windowID, startsAt); err != nil {
 			return err
 		}

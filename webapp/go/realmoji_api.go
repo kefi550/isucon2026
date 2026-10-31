@@ -75,11 +75,19 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if actor == post.AuthorID {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
-		tx, err := beginRelationshipTx(ctx, h.DB, actor, post.AuthorID)
+		tx, err := h.DB.BeginTxx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
+		// 画像の書き込みが終わるまで、2人分の行ロックは取らない。
+		imageID := uuid.NewString()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES($1,$2,$3,'image/jpeg')`, imageID, actor, data); err != nil {
+			return err
+		}
+		if err := lockRelationshipUsers(ctx, tx, actor, post.AuthorID); err != nil {
+			return err
+		}
 		allowed, err := canViewPost(ctx, tx, actor, post.ID)
 		if err != nil {
 			return err
@@ -88,10 +96,6 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE realmojis SET replaced_at=clock_timestamp() WHERE post_id=$1 AND reactor_id=$2 AND replaced_at IS NULL AND deleted_at IS NULL`, post.ID, actor); err != nil {
-			return err
-		}
-		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES($1,$2,$3,'image/jpeg')`, imageID, actor, data); err != nil {
 			return err
 		}
 		id := uuid.NewString()

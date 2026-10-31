@@ -91,6 +91,12 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
+		// 画像の書き込みは行ロックを取らない。スロットの確認だけ、ロックのあとで行う。
+		postedAt := time.Now().UTC()
+		imageID := uuid.NewString()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, $3, 'image/jpeg', $4)`, imageID, userID, imageData, postedAt); err != nil {
+			return err
+		}
 		var lockedUserID string
 		if err := tx.GetContext(ctx, &lockedUserID, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID); err != nil {
 			return err
@@ -129,13 +135,8 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
   `, userID, window.LocalDate); err != nil {
 			return err
 		}
-		postedAt := time.Now().UTC()
 		if counts.Active != 0 || counts.Deleted >= 2 || postedAt.Before(window.StartsAt) {
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-		}
-		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, $3, 'image/jpeg', $4)`, imageID, userID, imageData, postedAt); err != nil {
-			return err
 		}
 		postID := uuid.NewString()
 		if _, err := tx.ExecContext(ctx, `

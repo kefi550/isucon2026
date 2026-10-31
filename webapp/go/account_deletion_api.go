@@ -17,6 +17,9 @@ func deleteAccountHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
+		if err := lockUserMembership(ctx, tx); err != nil {
+			return err
+		}
 		var lockedID string
 		err = tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 AND status='active' FOR NO KEY UPDATE`, userID)
 		if errors.Is(err, sql.ErrNoRows) {

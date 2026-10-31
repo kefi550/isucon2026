@@ -55,6 +55,13 @@ func (user *User) setImageKey() error {
 	return err
 }
 
+// 登録・退会・リージョン変更を、投稿期間の通知対象の確定と直列化する。
+// LOCK TABLE users は users への INSERT と UPDATE をすべて止めるので使わない。
+func lockUserMembership(ctx context.Context, tx *sqlx.Tx) error {
+	_, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('user_membership'), 1)`)
+	return err
+}
+
 func getUser(ctx context.Context, db sqlx.QueryerContext, userID string) (User, error) {
 	var user User
 	err := sqlx.GetContext(ctx, db, &user, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE id = $1 AND status = 'active'`, userID)

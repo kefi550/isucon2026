@@ -33,20 +33,29 @@ func beginRelationshipTx(ctx context.Context, db *sqlx.DB, actor, target string)
 	if err != nil {
 		return nil, err
 	}
-	// 2人分のロックを1往復で取る。ORDER BY で並べた順に行がロックされるので、
-	// 従来どおり id の昇順でロックすることになり、デッドロックを避ける性質は変わらない。
-	// COLLATE "C" はバイト順の比較で、Go の min/max（他の処理のロック順）と一致させるために必要。
-	var lockedIDs []string
-	if err := tx.SelectContext(ctx, &lockedIDs, `SELECT id FROM users WHERE id = ANY($1::text[]) AND status='active' ORDER BY id COLLATE "C" FOR NO KEY UPDATE`, []string{actor, target}); err != nil {
+	if err := lockRelationshipUsers(ctx, tx, actor, target); err != nil {
 		tx.Rollback()
 		return nil, err
 	}
+	return tx, nil
+}
+
+// 2人分のロックを1往復で取る。ORDER BY で並べた順に行がロックされるので、
+// 従来どおり id の昇順でロックすることになり、デッドロックを避ける性質は変わらない。
+// COLLATE "C" はバイト順の比較で、Go の min/max（他の処理のロック順）と一致させるために必要。
+func lockRelationshipUsers(ctx context.Context, tx *sqlx.Tx, actor, target string) error {
+	if actor == target || target == "" {
+		return NewAPIError(http.StatusBadRequest, "invalid_relationship")
+	}
+	var lockedIDs []string
+	if err := tx.SelectContext(ctx, &lockedIDs, `SELECT id FROM users WHERE id = ANY($1::text[]) AND status='active' ORDER BY id COLLATE "C" FOR NO KEY UPDATE`, []string{actor, target}); err != nil {
+		return err
+	}
 	if len(lockedIDs) != 2 {
 		// どちらかが存在しないか退会済み
-		tx.Rollback()
-		return nil, NewAPIError(http.StatusNotFound, "relationship_not_found")
+		return NewAPIError(http.StatusNotFound, "relationship_not_found")
 	}
-	return tx, nil
+	return nil
 }
 
 func isBlocked(ctx context.Context, db sqlx.QueryerContext, actor, target string) (bool, error) {
