@@ -2,6 +2,36 @@
 -- 2回目以降の CREATE INDEX IF NOT EXISTS は何もしない。
 
 CREATE INDEX IF NOT EXISTS image_objects_id ON image_objects (id);
+
+-- 今日の新しい画像が入るパーティション（image_objects_20261028）を、id のハッシュで16個に分ける。
+-- 新しい画像（投稿・RealMoji・プロフィール画像。約500KB）は TOAST に入り、同時に INSERT すると、
+-- 1つの TOAST テーブルの「リレーション拡張ロック」を取り合って順番待ちになる（日の頭に集中し、1ベンチで合計 約109秒）。
+-- 分けると TOAST テーブルが16個に分かれ、拡張ロックの取り合いが約16分の1になる。
+-- 主キー (id, created_at) は、どちらのパーティションキーも含むのでそのまま使える。id の等値検索は1つに絞られる。
+-- このパーティションは初期化のたびに reset.sql が TRUNCATE する（init.sh は reset.sql の後にこのファイルを流す）ので、
+-- 通常は空。念のため、行があれば新しいパーティションへ移す。2回目以降（分割済み）と、パーティションがない DB では何もしない。
+DO $$
+DECLARE
+  v_kind "char";
+BEGIN
+  SELECT c.relkind INTO v_kind FROM pg_class c WHERE c.oid = to_regclass('image_objects_20261028');
+  IF v_kind IS NULL OR v_kind = 'p' THEN
+    RETURN;
+  END IF;
+  ALTER TABLE image_objects DETACH PARTITION image_objects_20261028;
+  ALTER TABLE image_objects_20261028 RENAME TO image_objects_20261028_old;
+  CREATE TABLE image_objects_20261028 PARTITION OF image_objects
+    FOR VALUES FROM ('2026-10-28 06:00:00+00') TO ('2026-11-01 00:00:00+00') PARTITION BY HASH (id);
+  FOR i IN 0..15 LOOP
+    EXECUTE format(
+      'CREATE TABLE image_objects_20261028_h%s PARTITION OF image_objects_20261028 FOR VALUES WITH (MODULUS 16, REMAINDER %s)',
+      lpad(i::text, 2, '0'), i);
+  END LOOP;
+  INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at)
+    SELECT id, owner_user_id, data, media_type, created_at FROM image_objects_20261028_old;
+  DROP TABLE image_objects_20261028_old;
+END
+$$;
 -- ユーザー名の一意性は register の LOCK TABLE ではなく UNIQUE で保証する。
 -- 既存の非ユニーク index は UNIQUE の作成に成功してから消す。2回目以降はどちらも何もしない。
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_key ON users (username);
