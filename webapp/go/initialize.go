@@ -17,16 +17,18 @@ type initializeResponse struct {
 
 func initializeHandler(*HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
+		clearImageSignatureCache()
 		cmd := exec.Command("../sql/init.sh")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return err
 		}
+		clearImageSignatureCache()
 
 		// Set language to the implementation language.
 		// Agents optimizing this app: set agent, harness, and model to the names used.
 		// For multiple models, use comma-separated names; use brain when no AI model is used.
-		return c.JSON(http.StatusOK, initializeResponse{Language: "go", Agent: "human", Harness: "manual", Model: "brain"})
+		return c.JSON(http.StatusOK, initializeResponse{Language: "go", Agent: "grok", Harness: "cursor", Model: "grok-4.7"})
 	}
 }
