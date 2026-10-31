@@ -145,22 +145,48 @@ func TestGetImageEquivalence(t *testing.T) {
 		}
 	}
 
+	// 比較するパスは1周目で作り、2周目も同じものを使う（2周目は created_at のキャッシュが効く経路になる）
+	clearImageCreatedAtCache()
+	var paths []string
 	for _, img := range images {
 		signed := signedImageURL(img.owner.User, img.id)
-		path := strings.TrimPrefix(signed, "/api")
-		compare(path) // 正しい署名
+		paths = append(paths, strings.TrimPrefix(signed, "/api")) // 正しい署名
 		other := users[rng.Intn(len(users))]
-		compare(strings.TrimPrefix(signedImageURL(other.User, img.id), "/api")) // 他人のキーで署名（多くは不正署名）
+		paths = append(paths, strings.TrimPrefix(signedImageURL(other.User, img.id), "/api")) // 他人のキーで署名（多くは不正署名）
 		exp := strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)
-		compare("/images/" + img.id + "?exp=" + exp + "&sig=" + strings.Repeat("A", 43)) // 長さは正しいが不正な署名
-		compare("/images/" + img.id + "?exp=1&sig=" + strings.Repeat("A", 43))           // 期限切れ
+		paths = append(paths, "/images/"+img.id+"?exp="+exp+"&sig="+strings.Repeat("A", 43)) // 長さは正しいが不正な署名
+		paths = append(paths, "/images/"+img.id+"?exp=1&sig="+strings.Repeat("A", 43))       // 期限切れ
 	}
-	compare("/images/" + uuid.NewString() + "?exp=9999999999&sig=" + strings.Repeat("A", 43)) // 存在しない画像
-	compare("/images/x")                                                                      // パラメーター不足
-	compare("/images/x?exp=abc&sig=zz")                                                       // 形式不正
-
-	t.Logf("比較 %d 回（200: %d、不正署名: %d、その他 403 など: %d）", compared, ok200, abused, forbidden)
+	paths = append(paths,
+		"/images/"+uuid.NewString()+"?exp=9999999999&sig="+strings.Repeat("A", 43), // 存在しない画像
+		"/images/x",                // パラメーター不足
+		"/images/x?exp=abc&sig=zz", // 形式不正
+	)
+	for _, path := range paths {
+		compare(path)
+	}
+	t.Logf("1周目: 比較 %d 回（200: %d、不正署名: %d、その他 403 など: %d）", compared, ok200, abused, forbidden)
 	if ok200 == 0 || abused == 0 || forbidden == 0 {
 		t.Fatal("テストデータが偏っていて検証になっていない")
+	}
+	cached := len(imageCreatedAtCache)
+	if cached == 0 {
+		t.Fatal("1周目で created_at がキャッシュされていない")
+	}
+
+	// キャッシュが残ったまま DB の状態を変え、2周目も新旧が一致することを確かめる。
+	// 特に、行が消えた画像に不正な署名でアクセスしても abuse を記録しない（署名検証の前に 403）ことを確かめる。
+	exec(`DELETE FROM image_objects WHERE id IN (SELECT id FROM image_objects ORDER BY id LIMIT 40)`)
+	exec(`UPDATE posts SET deleted_at = now() WHERE id IN (SELECT id FROM posts WHERE deleted_at IS NULL ORDER BY id LIMIT 10)`)
+	exec(`UPDATE realmojis SET replaced_at = now() WHERE id IN (SELECT id FROM realmojis WHERE replaced_at IS NULL AND deleted_at IS NULL ORDER BY id LIMIT 10)`)
+	exec(`UPDATE users SET status = 'deleted' WHERE id IN (SELECT id FROM users WHERE status = 'active' ORDER BY id LIMIT 3)`)
+	exec(`UPDATE users SET profile_image_id = NULL WHERE id IN (SELECT id FROM users WHERE profile_image_id IS NOT NULL ORDER BY id LIMIT 3)`)
+	compared, ok200, abused, forbidden = 0, 0, 0, 0
+	for _, path := range paths {
+		compare(path)
+	}
+	t.Logf("2周目（キャッシュ %d 件が残った状態）: 比較 %d 回（200: %d、不正署名: %d、その他 403 など: %d）", cached, compared, ok200, abused, forbidden)
+	if ok200 == 0 || abused == 0 || forbidden == 0 {
+		t.Fatal("2周目のテストデータが偏っていて検証になっていない")
 	}
 }

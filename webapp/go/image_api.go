@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/labstack/echo/v5"
@@ -18,6 +19,55 @@ type getImageRequest struct {
 	ImageID string `param:"imageId" json:"-"`
 	Exp     string `query:"exp" json:"-"`
 	Sig     string `query:"sig" json:"-"`
+}
+
+// imageLookupQuery は画像の所有者の署名キー・参照状態・データを1本で取るクエリ。
+// 呼び出し側で末尾に条件を足せるよう、WHERE 句で終わらせている。
+const imageLookupQuery = `
+   SELECT u.secret_key_hash, a.available, CASE WHEN a.available THEN i.data END AS data, i.media_type, i.created_at
+   FROM image_objects i JOIN users u ON u.id = i.owner_user_id
+   CROSS JOIN LATERAL (
+     SELECT COALESCE(u.profile_image_id = i.id, false)
+       OR EXISTS (
+         SELECT 1 FROM posts p
+         WHERE p.image_id = i.id AND p.author_id = u.id AND p.deleted_at IS NULL
+       )
+       OR EXISTS (
+         SELECT 1 FROM realmojis r
+         JOIN posts p ON p.id = r.post_id AND p.deleted_at IS NULL
+         JOIN users author ON author.id = p.author_id AND author.status = 'active'
+         WHERE r.image_id = i.id AND r.reactor_id = u.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
+       ) AS available
+     OFFSET 0 -- 展開されると available を参照するたびに EXISTS が再評価されるため、1回だけ評価させる
+   ) a
+   WHERE i.id = $1 AND u.status = 'active'`
+
+// 画像 ID → created_at のキャッシュ（このプロセスのメモリ内。サーバー間では共有しない）。
+// created_at は作成後に変わらず ID も使い回されないので、値が古くなることはない。
+// 行の有無はキャッシュに頼らず毎回 DB で確認する。
+var (
+	imageCreatedAtMu    sync.RWMutex
+	imageCreatedAtCache = map[string]time.Time{}
+)
+
+func loadImageCreatedAt(imageID string) (time.Time, bool) {
+	imageCreatedAtMu.RLock()
+	createdAt, ok := imageCreatedAtCache[imageID]
+	imageCreatedAtMu.RUnlock()
+	return createdAt, ok
+}
+
+func storeImageCreatedAt(imageID string, createdAt time.Time) {
+	imageCreatedAtMu.Lock()
+	imageCreatedAtCache[imageID] = createdAt
+	imageCreatedAtMu.Unlock()
+}
+
+// clearImageCreatedAtCache は初期化時に呼び、初期化で消える画像のぶんのメモリを解放する
+func clearImageCreatedAtCache() {
+	imageCreatedAtMu.Lock()
+	imageCreatedAtCache = map[string]time.Time{}
+	imageCreatedAtMu.Unlock()
 }
 
 func getImageHandler(h *HandlerContext) echo.HandlerFunc {
@@ -45,30 +95,23 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		// 削除状態は毎回確認する（即時反映も5秒以内の許容範囲に含まれる）。
 		// 画像データは参照中のときだけ返し、無効な画像のデータを転送しないようにする。
 		var object struct {
-			SecretKeyHash string `db:"secret_key_hash"`
-			Available     bool   `db:"available"`
-			Data          []byte `db:"data"`
-			MediaType     string `db:"media_type"`
+			SecretKeyHash string    `db:"secret_key_hash"`
+			Available     bool      `db:"available"`
+			Data          []byte    `db:"data"`
+			MediaType     string    `db:"media_type"`
+			CreatedAt     time.Time `db:"created_at"`
 		}
-		err = h.DB.GetContext(ctx, &object, `
-   SELECT u.secret_key_hash, a.available, CASE WHEN a.available THEN i.data END AS data, i.media_type
-   FROM image_objects i JOIN users u ON u.id = i.owner_user_id
-   CROSS JOIN LATERAL (
-     SELECT COALESCE(u.profile_image_id = i.id, false)
-       OR EXISTS (
-         SELECT 1 FROM posts p
-         WHERE p.image_id = i.id AND p.author_id = u.id AND p.deleted_at IS NULL
-       )
-       OR EXISTS (
-         SELECT 1 FROM realmojis r
-         JOIN posts p ON p.id = r.post_id AND p.deleted_at IS NULL
-         JOIN users author ON author.id = p.author_id AND author.status = 'active'
-         WHERE r.image_id = i.id AND r.reactor_id = u.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
-       ) AS available
-     OFFSET 0 -- 展開されると available を参照するたびに EXISTS が再評価されるため、1回だけ評価させる
-   ) a
-   WHERE i.id = $1 AND u.status = 'active'
-  `, input.ImageID)
+		// created_at（パーティションキー）が分かっていれば、1つのパーティションだけを引く。
+		// 分からなければ全パーティションから引き、次回のために created_at を覚えておく。
+		// どちらの経路でも画像の行の有無は毎回 DB で確認するので、行が消えた画像は従来どおり署名検証の前に 403 になる。
+		if createdAt, ok := loadImageCreatedAt(input.ImageID); ok {
+			err = h.DB.GetContext(ctx, &object, imageLookupQuery+` AND i.created_at = $2`, input.ImageID, createdAt)
+		} else {
+			err = h.DB.GetContext(ctx, &object, imageLookupQuery, input.ImageID)
+			if err == nil {
+				storeImageCreatedAt(input.ImageID, object.CreatedAt)
+			}
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}

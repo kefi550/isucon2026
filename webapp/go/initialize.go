@@ -18,6 +18,7 @@ type initializeResponse struct {
 func initializeHandler(*HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		clearImageSignatureCache()
+		clearImageCreatedAtCache()
 		cmd := exec.Command("../sql/init.sh")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -25,6 +26,7 @@ func initializeHandler(*HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		clearImageSignatureCache()
+		clearImageCreatedAtCache()
 
 		// Set language to the implementation language.
 		// Agents optimizing this app: set agent, harness, and model to the names used.
